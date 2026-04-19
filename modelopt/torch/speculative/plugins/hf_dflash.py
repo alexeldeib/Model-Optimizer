@@ -50,12 +50,10 @@ Draft model components:
            lazy rope pattern needed for MLA models.
 """
 
-import contextlib
 import logging
 
 import torch
 import torch.nn.functional as F
-from torch.nn import CrossEntropyLoss
 from transformers import PreTrainedModel
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config as _Qwen3Config
 from transformers.trainer_pt_utils import LabelSmoother
@@ -63,13 +61,13 @@ from transformers.utils import ModelOutput
 
 from ..dflash.conversion import DFlashDMRegistry
 from ..dflash.dflash_model import DFlashModel
+from .hf_spec_mixin import HFSpecDecMixin
 from .modeling_dflash import (  # noqa: F401
     DFlashAttention,
     DFlashBaseModelOutput,
     DFlashModule,
     build_target_layer_ids,
 )
-from .modeling_fakebase import _BASE_MODEL_PATHS, _EMBED_TOKENS_PATHS, _LM_HEAD_PATHS
 
 logger = logging.getLogger(__name__)
 
@@ -77,68 +75,8 @@ __all__ = ["HFDFlashModel"]
 
 
 @DFlashDMRegistry.register({PreTrainedModel: "hf.PreTrainedModel"})
-class HFDFlashModel(DFlashModel):
+class HFDFlashModel(HFSpecDecMixin, DFlashModel):
     """DFlash Model for HuggingFace transformers."""
-
-    @property
-    def _base_model(self):
-        return self.get_submodule(self.base_model_path)
-
-    @property
-    def _base_model_embeddings(self):
-        return self.get_submodule(self.base_model_embeddings_path)
-
-    @property
-    def _base_model_lm_head(self):
-        return self.get_submodule(self.base_model_lm_head_path)
-
-    @property
-    def _base_llm_config(self):
-        return (
-            getattr(self.config, "text_config", None)
-            or getattr(self.config, "llm_config", None)
-            or self.config
-        )
-
-    def _find_base_model_parts(self):
-        """Locate base model submodules (backbone, embeddings, lm_head) by probing known paths.
-
-        Reuses the shared path constants from modeling_fakebase (same as EAGLE).
-        """
-        for name, paths in {
-            "base_model_path": _BASE_MODEL_PATHS,
-            "base_model_embeddings_path": _EMBED_TOKENS_PATHS,
-            "base_model_lm_head_path": _LM_HEAD_PATHS,
-        }.items():
-            for path in paths:
-                try:
-                    submodule = self.get_submodule(path)
-                    assert isinstance(submodule, torch.nn.Module)
-                    setattr(self, name, path)
-                    break
-                except Exception:
-                    continue
-            else:
-                raise ValueError(f"Part {name} not found in model")
-
-    def _base_model_forward(self, input_ids, attention_mask, freeze=True, labels=None, **kwargs):
-        """Run the base model forward pass with optional freeze and base-model loss."""
-        ctx = torch.no_grad() if freeze else contextlib.nullcontext()
-        with ctx:
-            outputs = super().forward(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-                **kwargs,
-            )
-            base_loss = None
-            if not freeze and labels is not None:
-                loss_fct = CrossEntropyLoss()
-                base_loss = loss_fct(
-                    outputs.logits.view(-1, outputs.logits.shape[-1]),
-                    labels.view(-1),
-                )
-        return outputs, base_loss
 
     def modify(self, config):
         """Initialize DFlash draft module."""
