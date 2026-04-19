@@ -181,20 +181,17 @@ class HFDFlashModel(DFlashModel):
         self.dflash_config.block_size = self.dflash_block_size
 
         # Target layer IDs
-        num_target_layers = base_config.num_hidden_layers
+        num_target_layers = (
+            base_config.num_orig_hidden_layers
+            if self.dflash_offline
+            else base_config.num_hidden_layers
+        )
         num_draft_layers = self.dflash_config.num_hidden_layers
         self.target_layer_ids = build_target_layer_ids(num_target_layers, num_draft_layers)
         self.dflash_config.target_layer_ids = self.target_layer_ids
 
-        # mask_token_id: set in DFlashConfig (or auto-detected by main.py from tokenizer)
-        mask_id = config.dflash_mask_token_id
-        if mask_id is None:
-            raise ValueError(
-                "dflash_mask_token_id is required. Set it in the config YAML "
-                "(dflash.dflash_mask_token_id=TOKEN_ID) or let main.py auto-detect "
-                "from tokenizer.mask_token_id."
-            )
-        self.mask_token_id = mask_id
+        # mask_token_id: validated by DFlashConfig, auto-detected from tokenizer context
+        self.mask_token_id = config.dflash_mask_token_id
         logger.info("DFlash mask_token_id: %s", self.mask_token_id)
 
         # Freeze base model
@@ -207,9 +204,16 @@ class HFDFlashModel(DFlashModel):
         self.dflash_module = DFlashModule(self.dflash_config)
         # Match base model dtype/device. Skip if base is on meta (during from_pretrained
         # restore — the model will be moved to the correct device after weight loading).
-        base_device = next(self._base_model.layers[-1].parameters()).device
+        if self.dflash_offline:
+            base_device = self._base_model_lm_head.weight.device
+        else:
+            base_device = next(self._base_model.layers[-1].parameters()).device
         if base_device.type != "meta":
             self.dflash_module.to(self._base_model.dtype).to(base_device)
+
+        # Delete base model layers for offline training (save memory)
+        if self.dflash_offline:
+            self._base_model._modules.pop("layers")
 
         self.is_quantized = False
         self._num_anchors = self.dflash_num_anchors
@@ -465,9 +469,17 @@ class HFDFlashModel(DFlashModel):
             )
 
         # 1. Run base model → extract target hidden states
-        base_outputs = self._dflash_base_model_forward(
-            input_ids, attention_mask, freeze=self.dflash_freeze_base_model
-        )
+        if self.dflash_offline:
+            assert "base_model_outputs" in kwargs
+            base_outputs = DFlashBaseModelOutput.from_offline_dict(kwargs["base_model_outputs"])
+            if base_outputs.logits is None and self.dflash_self_logit_distillation:
+                # Compute logits from last-layer hidden states for KD loss
+                out_hiddens = kwargs["base_model_outputs"].get("base_model_hidden_states")
+                base_outputs.logits = self._base_model_lm_head(out_hiddens)
+        else:
+            base_outputs = self._dflash_base_model_forward(
+                input_ids, attention_mask, freeze=self.dflash_freeze_base_model
+            )
 
         # 2. Build loss mask.
         # When labels are provided (answer_only_loss), they already encode both

@@ -42,6 +42,14 @@ class DFlashBaseModelOutput:
     target_hidden: torch.Tensor  # concatenated hidden states from target layers [B, seq, N*H]
     logits: torch.Tensor | None = None  # base model logits [B, seq, vocab]
 
+    @classmethod
+    def from_offline_dict(cls, d: dict):
+        """Construct from a dict of pre-computed base model outputs (offline training)."""
+        return cls(
+            target_hidden=d.get("aux_hidden_states"),
+            logits=d.get("base_model_logits"),
+        )
+
 
 def build_target_layer_ids(num_target_layers, num_draft_layers):
     """Select layers uniformly from the target model for feature extraction."""
