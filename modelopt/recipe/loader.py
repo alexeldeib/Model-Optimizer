@@ -30,7 +30,7 @@ from .config import (
     RecipeType,
 )
 
-__all__ = ["load_config", "load_recipe"]
+__all__ = ["load_config", "load_recipe", "load_recipe_from_dict"]
 
 
 def _resolve_recipe_path(recipe_path: str | Path | Traversable) -> Path | Traversable:
@@ -88,22 +88,23 @@ def load_recipe(recipe_path: str | Path | Traversable) -> ModelOptRecipeBase:
     raise ValueError(f"Recipe path {recipe_path!r} is not a valid YAML file or directory.")
 
 
-def _load_recipe_from_file(recipe_file: Path | Traversable) -> ModelOptRecipeBase:
-    """Load a recipe from a YAML file.
+def load_recipe_from_dict(data: dict, source: str | None = None) -> ModelOptRecipeBase:
+    """Validate an already-loaded recipe dict into a typed recipe object.
 
-    The file must contain a ``metadata`` section with at least ``recipe_type``,
-    plus a ``quant_cfg`` mapping and an optional ``algorithm`` for PTQ recipes.
+    Use this when you have obtained the recipe dict through a path other than plain YAML —
+    e.g. after applying OmegaConf dotlist overrides on top of a recipe YAML.
+
+    ``source`` is a path or URL used only for error messages.
     """
-    data = load_config(recipe_file)
-
     metadata = data.get("metadata", {})
     recipe_type = metadata.get("recipe_type")
+    source_str = f"{source!s} " if source is not None else ""
     if recipe_type is None:
-        raise ValueError(f"Recipe file {recipe_file} must contain a 'metadata.recipe_type' field.")
+        raise ValueError(f"Recipe {source_str}must contain a 'metadata.recipe_type' field.")
 
     if recipe_type == RecipeType.PTQ:
         if "quantize" not in data:
-            raise ValueError(f"PTQ recipe file {recipe_file} must contain 'quantize'.")
+            raise ValueError(f"PTQ recipe {source_str}must contain 'quantize'.")
         return ModelOptPTQRecipe(
             recipe_type=RecipeType.PTQ,
             description=metadata.get("description", "PTQ recipe."),
@@ -111,21 +112,36 @@ def _load_recipe_from_file(recipe_file: Path | Traversable) -> ModelOptRecipeBas
         )
     if recipe_type == RecipeType.SPECULATIVE_EAGLE:
         if "eagle" not in data:
-            raise ValueError(f"EAGLE recipe file {recipe_file} must contain 'eagle'.")
+            raise ValueError(f"EAGLE recipe {source_str}must contain 'eagle'.")
         return ModelOptEagleRecipe(
             recipe_type=RecipeType.SPECULATIVE_EAGLE,
             description=metadata.get("description", "EAGLE speculative decoding recipe."),
+            model=data.get("model") or {},
+            data=data.get("data") or {},
+            training=data.get("training") or {},
             eagle=data["eagle"],
         )
     if recipe_type == RecipeType.SPECULATIVE_DFLASH:
         if "dflash" not in data:
-            raise ValueError(f"DFlash recipe file {recipe_file} must contain 'dflash'.")
+            raise ValueError(f"DFlash recipe {source_str}must contain 'dflash'.")
         return ModelOptDFlashRecipe(
             recipe_type=RecipeType.SPECULATIVE_DFLASH,
             description=metadata.get("description", "DFlash speculative decoding recipe."),
+            model=data.get("model") or {},
+            data=data.get("data") or {},
+            training=data.get("training") or {},
             dflash=data["dflash"],
         )
     raise ValueError(f"Unsupported recipe type: {recipe_type!r}")
+
+
+def _load_recipe_from_file(recipe_file: Path | Traversable) -> ModelOptRecipeBase:
+    """Load a recipe from a YAML file.
+
+    The file must contain a ``metadata`` section with at least ``recipe_type``,
+    plus the algorithm-specific section (``quantize`` / ``eagle`` / ``dflash``).
+    """
+    return load_recipe_from_dict(load_config(recipe_file), source=str(recipe_file))
 
 
 def _load_recipe_from_dir(recipe_dir: Path | Traversable) -> ModelOptRecipeBase:

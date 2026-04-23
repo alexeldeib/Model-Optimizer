@@ -77,7 +77,33 @@ class ModelOptPTQRecipe(ModelOptRecipeBase):
     )
 
 
-class ModelOptEagleRecipe(ModelOptRecipeBase):
+class ModelOptSpeculativeRecipeBase(ModelOptRecipeBase):
+    """Base class for speculative-decoding recipes.
+
+    Unlike PTQ, speculative-decoding is a training-time optimization: the draft head is trained
+    with HF Trainer. We therefore bundle ``model`` / ``data`` / ``training`` sections into the
+    recipe so a single YAML is the full experiment spec. The three sections are plain dicts
+    (not Pydantic models) because their schema is owned by the example script's HF dataclasses.
+    """
+
+    model: dict = ModeloptField(
+        default={},
+        title="HF model args",
+        description="Dict merged into HfArgumentParser for ModelArguments.",
+    )
+    data: dict = ModeloptField(
+        default={},
+        title="HF data args",
+        description="Dict merged into HfArgumentParser for DataArguments.",
+    )
+    training: dict = ModeloptField(
+        default={},
+        title="HF training args",
+        description="Dict merged into HfArgumentParser for TrainingArguments.",
+    )
+
+
+class ModelOptEagleRecipe(ModelOptSpeculativeRecipeBase):
     """Our config class for EAGLE speculative decoding recipes."""
 
     eagle: EagleConfig = ModeloptField(
@@ -88,7 +114,7 @@ class ModelOptEagleRecipe(ModelOptRecipeBase):
     )
 
 
-class ModelOptDFlashRecipe(ModelOptRecipeBase):
+class ModelOptDFlashRecipe(ModelOptSpeculativeRecipeBase):
     """Our config class for DFlash speculative decoding recipes."""
 
     dflash: DFlashConfig = ModeloptField(

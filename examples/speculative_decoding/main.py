@@ -49,7 +49,7 @@ from transformers.trainer_utils import get_last_checkpoint
 
 import modelopt.torch.opt as mto
 import modelopt.torch.speculative as mtsp
-from modelopt.recipe import load_recipe
+from modelopt.recipe import load_recipe_from_dict
 from modelopt.recipe.config import ModelOptDFlashRecipe, ModelOptEagleRecipe
 from modelopt.torch.speculative.config import EagleConfig
 from modelopt.torch.speculative.utils import load_vlm_or_llm, patch_transformers5_params_loading
@@ -146,38 +146,30 @@ class MedusaArguments:
     medusa_num_layers: int | None = field(default=1)
 
 
-def _parse_cli() -> tuple[str, str | None, list[str]]:
-    """Parse --config (required) and --recipe (optional) from argv.
+def _parse_cli() -> tuple[str, list[str]]:
+    """Parse --config (required) from argv; return remaining args as config overrides.
 
     Extra arguments use OmegaConf dotlist syntax, e.g.
     ``model.model_name_or_path=meta-llama/Llama-3.2-1B training.output_dir=ckpts/test``.
     """
     p = argparse.ArgumentParser(add_help=False)
-    p.add_argument("--config", required=True, help="Path to the YAML config file.")
     p.add_argument(
-        "--recipe",
-        default=None,
-        help=(
-            "Optional modelopt recipe name or path for the speculative-decoding config. "
-            "Supports EAGLE (speculative_eagle) and DFlash (speculative_dflash) recipes. "
-            "When set, the matching section from --config is ignored and this recipe is used instead."
-        ),
+        "--config",
+        required=True,
+        help="Path to a modelopt speculative-decoding recipe YAML (speculative_eagle / speculative_dflash).",
     )
     args, overrides = p.parse_known_args()
-    return args.config, args.recipe, overrides
+    return args.config, overrides
 
 
-def _load_config(
-    config_path: str, recipe_path: str | None = None, overrides: list[str] = ()
-) -> tuple[dict, dict, dict]:
-    """Load training config from a YAML file with sections: model, data, training, eagle/dflash.
+def _load_config(config_path: str, overrides: list[str] = ()) -> tuple[dict, dict, dict]:
+    """Load a speculative-decoding recipe YAML into (hf_cfg, eagle_cfg, dflash_cfg).
 
-    *overrides* are OmegaConf dotlist entries (e.g. ``["model.model_name_or_path=xxx"]``)
-    applied on top of the YAML.
+    The YAML must be a modelopt recipe — ``metadata.recipe_type`` is ``speculative_eagle`` or
+    ``speculative_dflash`` — with ``model`` / ``data`` / ``training`` sections for HF Trainer
+    plus the algorithm-specific ``eagle`` or ``dflash`` section.
 
-    When *recipe_path* is provided, the matching section is sourced from the recipe instead
-    of from the YAML file — the recipe goes through ``modelopt.recipe.load_recipe`` and yields
-    either a ``ModelOptEagleRecipe`` or ``ModelOptDFlashRecipe``.
+    *overrides* are OmegaConf dotlist entries applied on top of the YAML.
 
     Returns:
         hf_cfg: Flat dict from model/data/training sections, for HfArgumentParser.parse_dict()
@@ -187,27 +179,23 @@ def _load_config(
     merged = OmegaConf.load(config_path)
     if overrides:
         merged = OmegaConf.merge(merged, OmegaConf.from_dotlist(list(overrides)))
-    cfg = OmegaConf.to_container(merged, resolve=True)
+    data = OmegaConf.to_container(merged, resolve=True)
 
-    eagle_cfg = cfg.get("eagle", {})
-    dflash_cfg = cfg.get("dflash", {})
-    if recipe_path is not None:
-        recipe = load_recipe(recipe_path)
-        if isinstance(recipe, ModelOptEagleRecipe):
-            eagle_cfg = recipe.eagle.model_dump()
-        elif isinstance(recipe, ModelOptDFlashRecipe):
-            dflash_cfg = recipe.dflash.model_dump()
-        else:
-            raise ValueError(
-                f"--recipe expected an EAGLE or DFlash recipe, got "
-                f"{type(recipe).__name__} from {recipe_path}"
-            )
+    recipe = load_recipe_from_dict(data, source=config_path)
 
-    hf_cfg = {
-        **cfg.get("model", {}),
-        **cfg.get("data", {}),
-        **cfg.get("training", {}),
-    }
+    eagle_cfg: dict = {}
+    dflash_cfg: dict = {}
+    if isinstance(recipe, ModelOptEagleRecipe):
+        eagle_cfg = recipe.eagle.model_dump()
+    elif isinstance(recipe, ModelOptDFlashRecipe):
+        dflash_cfg = recipe.dflash.model_dump()
+    else:
+        raise ValueError(
+            f"--config expected an EAGLE or DFlash recipe, got "
+            f"{type(recipe).__name__} from {config_path}"
+        )
+
+    hf_cfg = {**recipe.model, **recipe.data, **recipe.training}
 
     if hf_cfg.get("dp_shard_size") is None:
         cp_size = hf_cfg.get("cp_size", 1)
@@ -219,8 +207,8 @@ def _load_config(
 
 
 def train():
-    config_path, recipe_path, overrides = _parse_cli()
-    hf_cfg, eagle_cfg, dflash_cfg = _load_config(config_path, recipe_path, overrides)
+    config_path, overrides = _parse_cli()
+    hf_cfg, eagle_cfg, dflash_cfg = _load_config(config_path, overrides)
 
     parser = transformers.HfArgumentParser(
         (

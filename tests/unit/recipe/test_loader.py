@@ -25,7 +25,7 @@ from modelopt.recipe.config import (
     ModelOptPTQRecipe,
     RecipeType,
 )
-from modelopt.recipe.loader import load_config, load_recipe
+from modelopt.recipe.loader import load_config, load_recipe, load_recipe_from_dict
 
 # ---------------------------------------------------------------------------
 # Static YAML fixtures
@@ -200,11 +200,14 @@ def test_load_recipe_dir_missing_quantize_raises(tmp_path):
 
 def test_load_recipe_eagle_builtin():
     """load_recipe loads the built-in EAGLE recipe and returns a ModelOptEagleRecipe."""
-    recipe = load_recipe("general/speculative_decoding/eagle3_recipe")
+    recipe = load_recipe("general/speculative_decoding/eagle3")
     assert recipe.recipe_type == RecipeType.SPECULATIVE_EAGLE
     assert isinstance(recipe, ModelOptEagleRecipe)
     assert recipe.eagle.eagle_decoder_type == "llama"
     assert recipe.eagle.eagle_ttt_steps == 3
+    # Full-pipeline recipe also carries HF trainer sections.
+    assert "mode" in recipe.training
+    assert recipe.training["mode"] == "eagle3"
 
 
 def test_load_recipe_eagle_dir(tmp_path):
@@ -248,11 +251,14 @@ def test_load_recipe_eagle_field_validation_raises(tmp_path):
 
 def test_load_recipe_dflash_builtin():
     """load_recipe loads the built-in DFlash recipe and returns a ModelOptDFlashRecipe."""
-    recipe = load_recipe("general/speculative_decoding/dflash_recipe")
+    recipe = load_recipe("general/speculative_decoding/dflash")
     assert recipe.recipe_type == RecipeType.SPECULATIVE_DFLASH
     assert isinstance(recipe, ModelOptDFlashRecipe)
     assert recipe.dflash.dflash_block_size == 8
     assert recipe.dflash.dflash_num_anchors == 512
+    # Full-pipeline recipe also carries HF trainer sections.
+    assert "mode" in recipe.training
+    assert recipe.training["mode"] == "dflash"
 
 
 def test_load_recipe_dflash_dir(tmp_path):
@@ -277,6 +283,23 @@ def test_load_recipe_dflash_missing_section_raises(tmp_path):
     bad.write_text("metadata:\n  recipe_type: speculative_dflash\n")
     with pytest.raises(ValueError, match="dflash"):
         load_recipe(bad)
+
+
+def test_load_recipe_from_dict_eagle_with_training_sections():
+    """load_recipe_from_dict accepts a pre-merged dict and populates HF trainer sections."""
+    data = {
+        "metadata": {"recipe_type": "speculative_eagle"},
+        "model": {"model_name_or_path": "TinyLlama/TinyLlama-1.1B-Chat-v1.0"},
+        "data": {"data_path": "train.jsonl"},
+        "training": {"mode": "eagle3", "output_dir": "ckpts/test"},
+        "eagle": {"eagle_decoder_type": "llama", "eagle_ttt_steps": 2},
+    }
+    recipe = load_recipe_from_dict(data)
+    assert isinstance(recipe, ModelOptEagleRecipe)
+    assert recipe.model["model_name_or_path"] == "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    assert recipe.data["data_path"] == "train.jsonl"
+    assert recipe.training["output_dir"] == "ckpts/test"
+    assert recipe.eagle.eagle_ttt_steps == 2
 
 
 def test_load_recipe_dflash_field_validation_raises(tmp_path):
