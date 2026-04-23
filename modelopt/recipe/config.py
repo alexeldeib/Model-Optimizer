@@ -117,6 +117,8 @@ class ModelOptSpeculativeRecipeBase(ModelOptRecipeBase):
 class ModelOptEagleRecipe(ModelOptSpeculativeRecipeBase):
     """Our config class for EAGLE speculative decoding recipes."""
 
+    recipe_type: RecipeType = RecipeType.SPECULATIVE_EAGLE
+
     eagle: EagleConfig = ModeloptField(
         default=EagleConfig(),
         title="EAGLE config",
@@ -128,6 +130,8 @@ class ModelOptEagleRecipe(ModelOptSpeculativeRecipeBase):
 class ModelOptDFlashRecipe(ModelOptSpeculativeRecipeBase):
     """Our config class for DFlash speculative decoding recipes."""
 
+    recipe_type: RecipeType = RecipeType.SPECULATIVE_DFLASH
+
     dflash: DFlashConfig = ModeloptField(
         default=DFlashConfig(),
         title="DFlash config",
@@ -138,6 +142,8 @@ class ModelOptDFlashRecipe(ModelOptSpeculativeRecipeBase):
 
 class ModelOptMedusaRecipe(ModelOptSpeculativeRecipeBase):
     """Our config class for Medusa speculative decoding recipes."""
+
+    recipe_type: RecipeType = RecipeType.SPECULATIVE_MEDUSA
 
     medusa: MedusaConfig = ModeloptField(
         default=MedusaConfig(),

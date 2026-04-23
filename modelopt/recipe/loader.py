@@ -154,7 +154,6 @@ def _load_recipe_from_file(
         if "eagle" not in data:
             raise ValueError(f"EAGLE recipe file {recipe_file} must contain 'eagle'.")
         return ModelOptEagleRecipe(
-            recipe_type=RecipeType.SPECULATIVE_EAGLE,
             description=metadata.get("description", "EAGLE speculative decoding recipe."),
             model=data.get("model") or {},
             data=data.get("data") or {},
@@ -165,7 +164,6 @@ def _load_recipe_from_file(
         if "dflash" not in data:
             raise ValueError(f"DFlash recipe file {recipe_file} must contain 'dflash'.")
         return ModelOptDFlashRecipe(
-            recipe_type=RecipeType.SPECULATIVE_DFLASH,
             description=metadata.get("description", "DFlash speculative decoding recipe."),
             model=data.get("model") or {},
             data=data.get("data") or {},
@@ -176,7 +174,6 @@ def _load_recipe_from_file(
         if "medusa" not in data:
             raise ValueError(f"Medusa recipe file {recipe_file} must contain 'medusa'.")
         return ModelOptMedusaRecipe(
-            recipe_type=RecipeType.SPECULATIVE_MEDUSA,
             description=metadata.get("description", "Medusa speculative decoding recipe."),
             model=data.get("model") or {},
             data=data.get("data") or {},
