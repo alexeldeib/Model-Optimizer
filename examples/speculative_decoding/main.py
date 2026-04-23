@@ -211,7 +211,11 @@ def train():
         )
 
     callbacks = [EagleTrainingPlot(training_args.ar_validate_steps, training_args.estimate_ar)]
-    if eagle_cfg.get("eagle_base_lora") and eagle_cfg.get("eagle_base_lora_warmup_steps", 0) > 0:
+    if (
+        isinstance(recipe, ModelOptEagleRecipe)
+        and eagle_cfg.get("eagle_base_lora")
+        and eagle_cfg.get("eagle_base_lora_warmup_steps", 0) > 0
+    ):
         callbacks.append(LoRAWarmupCallback(eagle_cfg["eagle_base_lora_warmup_steps"]))
 
     trainer = EagleTrainerWithAccLog(
