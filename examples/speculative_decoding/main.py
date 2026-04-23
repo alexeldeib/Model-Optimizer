@@ -50,7 +50,7 @@ from transformers.trainer_utils import get_last_checkpoint
 import modelopt.torch.opt as mto
 import modelopt.torch.speculative as mtsp
 from modelopt.recipe import load_recipe_from_dict
-from modelopt.recipe.config import ModelOptDFlashRecipe, ModelOptEagleRecipe
+from modelopt.recipe.config import ModelOptDFlashRecipe, ModelOptEagleRecipe, ModelOptMedusaRecipe
 from modelopt.torch.speculative.config import EagleConfig
 from modelopt.torch.speculative.utils import load_vlm_or_llm, patch_transformers5_params_loading
 from modelopt.torch.utils import print_rank_0
@@ -93,12 +93,15 @@ def _parse_cli() -> tuple[str, list[str]]:
     return args.config, overrides
 
 
+_SUPPORTED_RECIPES = (ModelOptEagleRecipe, ModelOptDFlashRecipe, ModelOptMedusaRecipe)
+
+
 def _load_recipe(config_path: str, overrides: list[str] = ()):
     """Load a speculative-decoding recipe YAML with OmegaConf dotlist merge + Pydantic validation.
 
-    The YAML must be a modelopt recipe — ``metadata.recipe_type`` is ``speculative_eagle`` or
-    ``speculative_dflash`` — with ``model`` / ``data`` / ``training`` / ``medusa`` sections plus
-    the algorithm-specific ``eagle`` or ``dflash`` section.
+    The YAML must be a modelopt recipe — ``metadata.recipe_type`` is ``speculative_eagle``,
+    ``speculative_dflash`` or ``speculative_medusa`` — with ``model`` / ``data`` / ``training``
+    sections plus the algorithm-specific ``eagle`` / ``dflash`` / ``medusa`` section.
 
     *overrides* are OmegaConf dotlist entries applied on top of the YAML.
     """
@@ -108,9 +111,9 @@ def _load_recipe(config_path: str, overrides: list[str] = ()):
     data = OmegaConf.to_container(merged, resolve=True)
 
     recipe = load_recipe_from_dict(data, source=config_path)
-    if not isinstance(recipe, (ModelOptEagleRecipe, ModelOptDFlashRecipe)):
+    if not isinstance(recipe, _SUPPORTED_RECIPES):
         raise ValueError(
-            f"--config expected an EAGLE or DFlash recipe, got "
+            f"--config expected an EAGLE / DFlash / Medusa recipe, got "
             f"{type(recipe).__name__} from {config_path}"
         )
     return recipe
@@ -124,7 +127,6 @@ def train():
     # reconstructed as an HF dataclass so it can be handed to transformers.Trainer.
     model_args = recipe.model
     data_args = recipe.data
-    medusa_args = recipe.medusa
 
     training_dict = recipe.training.model_dump()
     if training_dict.get("dp_shard_size") is None:
@@ -167,8 +169,7 @@ def train():
         # Specific patch to accelerate 1.12.0. Removable after move to 1.13.0
         training_args.parallelism_config.sp_backend = None
     print_rank_0(
-        f"arguments: {model_args}, {training_args}, {medusa_args}, "
-        f"eagle_cfg={eagle_cfg}, dflash_cfg={dflash_cfg}"
+        f"arguments: {model_args}, {training_args}, eagle_cfg={eagle_cfg}, dflash_cfg={dflash_cfg}"
     )
 
     # Detect checkpoint to resume from
@@ -228,11 +229,12 @@ def train():
             trust_remote_code=model_args.trust_remote_code,
         )
         if training_args.mode == "medusa":
-            config = {
-                "medusa_num_heads": medusa_args.medusa_num_heads,
-                "medusa_num_layers": medusa_args.medusa_num_layers,
-            }
-            mtsp.convert(model, [("medusa", config)])
+            if not isinstance(recipe, ModelOptMedusaRecipe):
+                raise ValueError(
+                    f"training.mode='medusa' requires a speculative_medusa recipe, got "
+                    f"{type(recipe).__name__}"
+                )
+            mtsp.convert(model, [("medusa", recipe.medusa.model_dump())])
         elif training_args.mode == "eagle3":
             # Validate and rewrite eagle config fields
             eagle_cfg = EagleConfig.model_validate(

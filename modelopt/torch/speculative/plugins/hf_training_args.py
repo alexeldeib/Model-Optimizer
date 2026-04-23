@@ -84,13 +84,3 @@ class TrainingArguments(BaseModel):
     answer_only_loss: bool = False
     cp_size: int = 1
     dp_shard_size: int | None = None
-
-
-# TODO: deprecate medusa or align with new config
-class MedusaArguments(BaseModel):
-    """Arguments for Medusa heads."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    medusa_num_heads: int | None = 1
-    medusa_num_layers: int | None = 1

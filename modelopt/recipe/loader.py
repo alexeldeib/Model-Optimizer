@@ -25,6 +25,7 @@ from ._config_loader import BUILTIN_RECIPES_LIB, load_config
 from .config import (
     ModelOptDFlashRecipe,
     ModelOptEagleRecipe,
+    ModelOptMedusaRecipe,
     ModelOptPTQRecipe,
     ModelOptRecipeBase,
     RecipeType,
@@ -132,6 +133,17 @@ def load_recipe_from_dict(data: dict, source: str | None = None) -> ModelOptReci
             training=data.get("training") or {},
             dflash=data["dflash"],
         )
+    if recipe_type == RecipeType.SPECULATIVE_MEDUSA:
+        if "medusa" not in data:
+            raise ValueError(f"Medusa recipe {source_str}must contain 'medusa'.")
+        return ModelOptMedusaRecipe(
+            recipe_type=RecipeType.SPECULATIVE_MEDUSA,
+            description=metadata.get("description", "Medusa speculative decoding recipe."),
+            model=data.get("model") or {},
+            data=data.get("data") or {},
+            training=data.get("training") or {},
+            medusa=data["medusa"],
+        )
     raise ValueError(f"Unsupported recipe type: {recipe_type!r}")
 
 
@@ -209,5 +221,21 @@ def _load_recipe_from_dir(recipe_dir: Path | Traversable) -> ModelOptRecipeBase:
             recipe_type=RecipeType.SPECULATIVE_DFLASH,
             description=metadata.get("description", "DFlash speculative decoding recipe."),
             dflash=load_config(dflash_file),
+        )
+    if recipe_type == RecipeType.SPECULATIVE_MEDUSA:
+        medusa_file = None
+        for name in ("medusa.yml", "medusa.yaml"):
+            candidate = recipe_dir.joinpath(name)
+            if candidate.is_file():
+                medusa_file = candidate
+                break
+        if medusa_file is None:
+            raise ValueError(
+                f"Cannot find medusa in {recipe_dir}. Looked for: medusa.yml, medusa.yaml"
+            )
+        return ModelOptMedusaRecipe(
+            recipe_type=RecipeType.SPECULATIVE_MEDUSA,
+            description=metadata.get("description", "Medusa speculative decoding recipe."),
+            medusa=load_config(medusa_file),
         )
     raise ValueError(f"Unsupported recipe type: {recipe_type!r}")

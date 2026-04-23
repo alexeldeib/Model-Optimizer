@@ -23,12 +23,11 @@ from pydantic import field_validator
 
 from modelopt.torch.opt.config import ModeloptBaseConfig, ModeloptField
 from modelopt.torch.quantization.config import QuantizeConfig
-from modelopt.torch.speculative.config import DFlashConfig, EagleConfig
+from modelopt.torch.speculative.config import DFlashConfig, EagleConfig, MedusaConfig
+from modelopt.torch.speculative.plugins.hf_training_args import DataArguments as SpecDataArgs
+from modelopt.torch.speculative.plugins.hf_training_args import ModelArguments as SpecModelArgs
 from modelopt.torch.speculative.plugins.hf_training_args import (
-    DataArguments,
-    MedusaArguments,
-    ModelArguments,
-    TrainingArguments,
+    TrainingArguments as SpecTrainingArgs,
 )
 
 
@@ -38,6 +37,7 @@ class RecipeType(str, Enum):
     PTQ = "ptq"
     SPECULATIVE_EAGLE = "speculative_eagle"
     SPECULATIVE_DFLASH = "speculative_dflash"
+    SPECULATIVE_MEDUSA = "speculative_medusa"
     # QAT = "qat" # Not implemented yet, will be added in the future.
 
 
@@ -94,28 +94,22 @@ class ModelOptSpeculativeRecipeBase(ModelOptRecipeBase):
     ``TrainingArguments`` via ``extra='allow'``.
     """
 
-    model: ModelArguments = ModeloptField(
-        default=ModelArguments(),
+    model: SpecModelArgs = ModeloptField(
+        default=SpecModelArgs(),
         title="HF model args",
         description="ModelArguments for the base HF model to train a draft head against.",
         validate_default=True,
     )
-    data: DataArguments = ModeloptField(
-        default=DataArguments(),
+    data: SpecDataArgs = ModeloptField(
+        default=SpecDataArgs(),
         title="HF data args",
         description="DataArguments for the training/offline dataset.",
         validate_default=True,
     )
-    training: TrainingArguments = ModeloptField(
-        default=TrainingArguments(),
+    training: SpecTrainingArgs = ModeloptField(
+        default=SpecTrainingArgs(),
         title="HF training args",
         description="Speculative-decoding extensions; HF trainer fields flow through as extras.",
-        validate_default=True,
-    )
-    medusa: MedusaArguments = ModeloptField(
-        default=MedusaArguments(),
-        title="Medusa args",
-        description="Medusa-specific arguments (used only when training.mode == 'medusa').",
         validate_default=True,
     )
 
@@ -138,5 +132,16 @@ class ModelOptDFlashRecipe(ModelOptSpeculativeRecipeBase):
         default=DFlashConfig(),
         title="DFlash config",
         description="DFlash speculative decoding configuration.",
+        validate_default=True,
+    )
+
+
+class ModelOptMedusaRecipe(ModelOptSpeculativeRecipeBase):
+    """Our config class for Medusa speculative decoding recipes."""
+
+    medusa: MedusaConfig = ModeloptField(
+        default=MedusaConfig(),
+        title="Medusa config",
+        description="Medusa speculative decoding configuration.",
         validate_default=True,
     )
