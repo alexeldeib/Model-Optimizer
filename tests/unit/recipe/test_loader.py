@@ -25,7 +25,7 @@ from modelopt.recipe.config import (
     ModelOptPTQRecipe,
     RecipeType,
 )
-from modelopt.recipe.loader import load_config, load_recipe, load_recipe_from_dict
+from modelopt.recipe.loader import _apply_dotlist, _load_recipe_from_dict, load_config, load_recipe
 
 # ---------------------------------------------------------------------------
 # Static YAML fixtures
@@ -254,7 +254,7 @@ def test_load_recipe_dflash_missing_section_raises(tmp_path):
 
 
 def test_load_recipe_from_dict_eagle_with_training_sections():
-    """load_recipe_from_dict accepts a pre-merged dict and populates typed HF trainer sections."""
+    """_load_recipe_from_dict accepts a pre-merged dict and populates typed HF trainer sections."""
     data = {
         "metadata": {"recipe_type": "speculative_eagle"},
         "model": {"model_name_or_path": "TinyLlama/TinyLlama-1.1B-Chat-v1.0"},
@@ -262,7 +262,7 @@ def test_load_recipe_from_dict_eagle_with_training_sections():
         "training": {"mode": "eagle3", "output_dir": "ckpts/test"},
         "eagle": {"eagle_decoder_type": "llama", "eagle_ttt_steps": 2},
     }
-    recipe = load_recipe_from_dict(data)
+    recipe = _load_recipe_from_dict(data)
     assert isinstance(recipe, ModelOptEagleRecipe)
     assert recipe.model.model_name_or_path == "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     assert recipe.data.data_path == "train.jsonl"
@@ -280,7 +280,7 @@ def test_typed_model_section_rejects_unknown_field():
         "eagle": {"eagle_decoder_type": "llama"},
     }
     with pytest.raises(Exception):  # pydantic.ValidationError
-        load_recipe_from_dict(data)
+        _load_recipe_from_dict(data)
 
 
 def test_typed_training_section_accepts_hf_extras():
@@ -295,12 +295,99 @@ def test_typed_training_section_accepts_hf_extras():
         },
         "eagle": {"eagle_decoder_type": "llama"},
     }
-    recipe = load_recipe_from_dict(data)
+    recipe = _load_recipe_from_dict(data)
     assert isinstance(recipe, ModelOptEagleRecipe)
     assert recipe.training.training_seq_len == 4096
     dumped = recipe.training.model_dump()
     assert dumped["num_train_epochs"] == 3
     assert dumped["learning_rate"] == 1e-4
+
+
+# ---------------------------------------------------------------------------
+# CLI-style dotlist overrides
+# ---------------------------------------------------------------------------
+
+
+def test_apply_dotlist_flat():
+    """_apply_dotlist sets a top-level key and parses the value with yaml.safe_load."""
+    result = _apply_dotlist({"a": 1}, ["b=2"])
+    assert result == {"a": 1, "b": 2}
+
+
+def test_apply_dotlist_nested_overwrite():
+    """_apply_dotlist overwrites a nested key without mutating input."""
+    original = {"model": {"trust_remote_code": False}}
+    result = _apply_dotlist(original, ["model.trust_remote_code=true"])
+    assert result["model"]["trust_remote_code"] is True
+    assert original["model"]["trust_remote_code"] is False  # input untouched
+
+
+def test_apply_dotlist_creates_missing_path():
+    """_apply_dotlist creates intermediate dicts when the path doesn't exist."""
+    result = _apply_dotlist({}, ["a.b.c=42"])
+    assert result == {"a": {"b": {"c": 42}}}
+
+
+def test_apply_dotlist_parses_typed_values():
+    """_apply_dotlist preserves yaml.safe_load's type inference."""
+    result = _apply_dotlist(
+        {},
+        [
+            "int_v=7",
+            "float_v=1.5",
+            "bool_v=true",
+            "null_v=null",
+            "list_v=[1, 2, 3]",
+            "str_v=hello",
+        ],
+    )
+    assert result == {
+        "int_v": 7,
+        "float_v": 1.5,
+        "bool_v": True,
+        "null_v": None,
+        "list_v": [1, 2, 3],
+        "str_v": "hello",
+    }
+
+
+def test_apply_dotlist_scientific_notation():
+    """OmegaConf parses ``1e-4`` as float natively (unlike yaml.safe_load in YAML 1.1 mode)."""
+    result = _apply_dotlist({}, ["lr=5e-5", "decay=1e-10", "still_str=hello"])
+    assert result["lr"] == 5e-5 and isinstance(result["lr"], float)
+    assert result["decay"] == 1e-10 and isinstance(result["decay"], float)
+    assert result["still_str"] == "hello"  # non-numeric strings stay as strings
+
+
+def test_apply_dotlist_malformed_raises():
+    """_apply_dotlist rejects entries missing the '=' separator."""
+    with pytest.raises(ValueError, match="missing '='"):
+        _apply_dotlist({}, ["foo_no_equals"])
+
+
+def test_load_recipe_with_overrides(tmp_path):
+    """load_recipe(path, overrides=...) merges dotlist entries before Pydantic validation."""
+    recipe_path = tmp_path / "recipe.yml"
+    recipe_path.write_text(
+        "metadata:\n  recipe_type: speculative_eagle\n"
+        "model:\n  trust_remote_code: false\n"
+        "eagle:\n  eagle_ttt_steps: 3\n"
+    )
+    recipe = load_recipe(
+        recipe_path,
+        overrides=["model.trust_remote_code=true", "eagle.eagle_ttt_steps=7"],
+    )
+    assert isinstance(recipe, ModelOptEagleRecipe)
+    assert recipe.model.trust_remote_code is True
+    assert recipe.eagle.eagle_ttt_steps == 7
+
+
+def test_load_recipe_overrides_rejected_for_dir(tmp_path):
+    """Overrides are not allowed for directory-format recipes."""
+    (tmp_path / "recipe.yml").write_text("metadata:\n  recipe_type: ptq\n")
+    (tmp_path / "quantize.yml").write_text("algorithm: max\nquant_cfg: []\n")
+    with pytest.raises(ValueError, match="directory-format"):
+        load_recipe(tmp_path, overrides=["quantize.algorithm=gptq"])
 
 
 def test_typed_data_sample_size_validator():
@@ -311,7 +398,7 @@ def test_typed_data_sample_size_validator():
         "eagle": {"eagle_decoder_type": "llama"},
     }
     with pytest.raises(Exception, match="sample_size"):  # pydantic.ValidationError
-        load_recipe_from_dict(data)
+        _load_recipe_from_dict(data)
 
 
 def test_load_recipe_dflash_field_validation_raises(tmp_path):

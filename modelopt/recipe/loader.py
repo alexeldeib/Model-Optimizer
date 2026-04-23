@@ -21,6 +21,8 @@ except ImportError:  # Python < 3.11
     from importlib.abc import Traversable
 from pathlib import Path
 
+from omegaconf import OmegaConf
+
 from ._config_loader import BUILTIN_RECIPES_LIB, load_config
 from .config import (
     ModelOptDFlashRecipe,
@@ -31,7 +33,7 @@ from .config import (
     RecipeType,
 )
 
-__all__ = ["load_config", "load_recipe", "load_recipe_from_dict"]
+__all__ = ["load_config", "load_recipe"]
 
 
 def _resolve_recipe_path(recipe_path: str | Path | Traversable) -> Path | Traversable:
@@ -56,8 +58,11 @@ def _resolve_recipe_path(recipe_path: str | Path | Traversable) -> Path | Traver
     return recipe_path
 
 
-def load_recipe(recipe_path: str | Path | Traversable) -> ModelOptRecipeBase:
-    """Load a recipe from a YAML file or directory.
+def load_recipe(
+    recipe_path: str | Path | Traversable,
+    overrides: list[str] | None = None,
+) -> ModelOptRecipeBase:
+    """Load a recipe from a YAML file or directory, with optional CLI-style overrides.
 
     ``recipe_path`` can be:
 
@@ -70,6 +75,12 @@ def load_recipe(recipe_path: str | Path | Traversable) -> ModelOptRecipeBase:
 
     The path may be relative to the built-in recipes library or an absolute /
     relative filesystem path.
+
+    ``overrides`` is an optional list of ``key.path=value`` dotlist entries applied
+    on top of the YAML before Pydantic validation. Values are parsed with
+    ``yaml.safe_load`` so they get proper types (``foo.bar=true`` → bool, ``foo=1``
+    → int, ``foo=[1,2]`` → list, etc.). Only supported when *recipe_path* is a
+    single YAML file.
     """
     resolved = _resolve_recipe_path(recipe_path)
 
@@ -82,22 +93,42 @@ def load_recipe(recipe_path: str | Path | Traversable) -> ModelOptRecipeBase:
     print(f"[load_recipe] loading: {_display}")
 
     if resolved.is_file():
-        return _load_recipe_from_file(resolved)
+        data = load_config(resolved)
+        if overrides:
+            data = _apply_dotlist(data, overrides)
+        return _load_recipe_from_dict(data, source=str(resolved))
 
     if resolved.is_dir():
+        if overrides:
+            raise ValueError(
+                "overrides are not supported for directory-format recipes; "
+                "use the single-YAML-file form instead."
+            )
         return _load_recipe_from_dir(resolved)
 
     raise ValueError(f"Recipe path {recipe_path!r} is not a valid YAML file or directory.")
 
 
-def load_recipe_from_dict(data: dict, source: str | None = None) -> ModelOptRecipeBase:
-    """Validate an already-loaded recipe dict into a typed recipe object.
+def _apply_dotlist(data: dict, overrides: list[str]) -> dict:
+    """Merge ``a.b.c=value`` dotlist overrides on top of ``data`` via OmegaConf.
 
-    Use this when you have obtained the recipe dict through a path other than plain YAML —
-    e.g. after applying OmegaConf dotlist overrides on top of a recipe YAML.
-
-    ``source`` is a path or URL used only for error messages.
+    OmegaConf handles type inference (int/float/bool/null/list/dict), scientific
+    notation (``1e-4`` → float), and nested deep-merge (creating missing intermediate
+    keys) — all of which save us from hand-rolling. We pre-validate that each entry
+    contains ``=``, since OmegaConf otherwise silently sets the missing key to ``null``.
     """
+    for entry in overrides:
+        if "=" not in entry:
+            raise ValueError(f"Invalid override (missing '='): {entry!r}")
+    merged = OmegaConf.merge(
+        OmegaConf.create(data),
+        OmegaConf.from_dotlist(list(overrides)),
+    )
+    return OmegaConf.to_container(merged, resolve=True)
+
+
+def _load_recipe_from_dict(data: dict, source: str | None = None) -> ModelOptRecipeBase:
+    """(private) Dispatch a recipe dict to the right Pydantic class via ``metadata.recipe_type``."""
     metadata = data.get("metadata", {})
     recipe_type = metadata.get("recipe_type")
     source_str = f"{source!s} " if source is not None else ""
@@ -146,15 +177,6 @@ def load_recipe_from_dict(data: dict, source: str | None = None) -> ModelOptReci
             medusa=data["medusa"],
         )
     raise ValueError(f"Unsupported recipe type: {recipe_type!r}")
-
-
-def _load_recipe_from_file(recipe_file: Path | Traversable) -> ModelOptRecipeBase:
-    """Load a recipe from a YAML file.
-
-    The file must contain a ``metadata`` section with at least ``recipe_type``,
-    plus the algorithm-specific section (``quantize`` / ``eagle`` / ``dflash``).
-    """
-    return load_recipe_from_dict(load_config(recipe_file), source=str(recipe_file))
 
 
 def _load_recipe_from_dir(recipe_dir: Path | Traversable) -> ModelOptRecipeBase:

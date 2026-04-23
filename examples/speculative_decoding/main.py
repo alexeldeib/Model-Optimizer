@@ -44,12 +44,11 @@ from eagle_utils import (
     make_speculative_data_module,
     patch_ring_attention_for_ttt,
 )
-from omegaconf import OmegaConf
 from transformers.trainer_utils import get_last_checkpoint
 
 import modelopt.torch.opt as mto
 import modelopt.torch.speculative as mtsp
-from modelopt.recipe import load_recipe_from_dict
+from modelopt.recipe import load_recipe
 from modelopt.recipe.config import ModelOptDFlashRecipe, ModelOptEagleRecipe, ModelOptMedusaRecipe
 from modelopt.torch.speculative.config import EagleConfig
 from modelopt.torch.speculative.utils import load_vlm_or_llm, patch_transformers5_params_loading
@@ -78,16 +77,19 @@ class HfTrainingArguments(transformers.TrainingArguments):
 
 
 def _parse_cli() -> tuple[str, list[str]]:
-    """Parse --config (required) from argv; return remaining args as config overrides.
+    """Parse --config (required) from argv; return remaining args as dotlist overrides.
 
-    Extra arguments use OmegaConf dotlist syntax, e.g.
+    Extra positional args use dotlist syntax, e.g.
     ``model.model_name_or_path=meta-llama/Llama-3.2-1B training.output_dir=ckpts/test``.
     """
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument(
         "--config",
         required=True,
-        help="Path to a modelopt speculative-decoding recipe YAML (speculative_eagle / speculative_dflash).",
+        help=(
+            "Path to a modelopt speculative-decoding recipe YAML "
+            "(speculative_eagle / speculative_dflash / speculative_medusa)."
+        ),
     )
     args, overrides = p.parse_known_args()
     return args.config, overrides
@@ -96,32 +98,14 @@ def _parse_cli() -> tuple[str, list[str]]:
 _SUPPORTED_RECIPES = (ModelOptEagleRecipe, ModelOptDFlashRecipe, ModelOptMedusaRecipe)
 
 
-def _load_recipe(config_path: str, overrides: list[str] = ()):
-    """Load a speculative-decoding recipe YAML with OmegaConf dotlist merge + Pydantic validation.
-
-    The YAML must be a modelopt recipe — ``metadata.recipe_type`` is ``speculative_eagle``,
-    ``speculative_dflash`` or ``speculative_medusa`` — with ``model`` / ``data`` / ``training``
-    sections plus the algorithm-specific ``eagle`` / ``dflash`` / ``medusa`` section.
-
-    *overrides* are OmegaConf dotlist entries applied on top of the YAML.
-    """
-    merged = OmegaConf.load(config_path)
-    if overrides:
-        merged = OmegaConf.merge(merged, OmegaConf.from_dotlist(list(overrides)))
-    data = OmegaConf.to_container(merged, resolve=True)
-
-    recipe = load_recipe_from_dict(data, source=config_path)
+def train():
+    config_path, overrides = _parse_cli()
+    recipe = load_recipe(config_path, overrides=overrides)
     if not isinstance(recipe, _SUPPORTED_RECIPES):
         raise ValueError(
             f"--config expected an EAGLE / DFlash / Medusa recipe, got "
             f"{type(recipe).__name__} from {config_path}"
         )
-    return recipe
-
-
-def train():
-    config_path, overrides = _parse_cli()
-    recipe = _load_recipe(config_path, overrides)
 
     # Pydantic-typed sections flow straight through as *_args; only TrainingArguments is
     # reconstructed as an HF dataclass so it can be handed to transformers.Trainer.
@@ -194,6 +178,11 @@ def train():
             checkpoint, trust_remote_code=model_args.trust_remote_code
         )
     else:
+        if model_args.model_name_or_path is None:
+            raise ValueError(
+                "model.model_name_or_path is required when no checkpoint is resumed. "
+                "Set it in the recipe YAML or pass model.model_name_or_path=<path> on the CLI."
+            )
         # To avoid OOM for large models, we load and convert model on CPU first.
         # Model will be moved to GPU during HF trainer.init().
         if use_offline_training:
@@ -245,7 +234,9 @@ def train():
 
             # Load draft vocab cache if the draft model uses a compressed vocabulary
             if model.eagle_config.draft_vocab_size < model.eagle_config.vocab_size:
-                if not os.path.isfile(data_args.draft_vocab_cache):
+                if data_args.draft_vocab_cache is None or not os.path.isfile(
+                    data_args.draft_vocab_cache
+                ):
                     raise FileNotFoundError(
                         f"Draft vocab cache provided but not found: {data_args.draft_vocab_cache}"
                     )
