@@ -107,13 +107,7 @@ def load_recipe(
 
 
 def _apply_dotlist(data: dict, overrides: list[str]) -> dict:
-    """Merge ``a.b.c=value`` dotlist overrides on top of ``data`` via OmegaConf.
-
-    OmegaConf handles type inference (int/float/bool/null/list/dict), scientific
-    notation (``1e-4`` → float), and nested deep-merge (creating missing intermediate
-    keys) — all of which save us from hand-rolling. We pre-validate that each entry
-    contains ``=``, since OmegaConf otherwise silently sets the missing key to ``null``.
-    """
+    """Merge ``a.b.c=value`` command line overrides on top of ``data`` via OmegaConf."""
     for entry in overrides:
         if "=" not in entry:
             raise ValueError(f"Invalid override (missing '='): {entry!r}")
