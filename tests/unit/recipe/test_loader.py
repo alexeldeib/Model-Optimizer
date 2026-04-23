@@ -210,22 +210,6 @@ def test_load_recipe_eagle_builtin():
     assert recipe.training.training_seq_len == 2048
 
 
-def test_load_recipe_eagle_dir(tmp_path):
-    """load_recipe loads an EAGLE recipe from a directory with recipe.yml + eagle.yml."""
-    (tmp_path / "recipe.yml").write_text(
-        "metadata:\n  recipe_type: speculative_eagle\n  description: Dir eagle test.\n"
-    )
-    (tmp_path / "eagle.yml").write_text(
-        "eagle_decoder_type: llama\neagle_ttt_steps: 5\neagle_use_torch_compile: false\n"
-    )
-    recipe = load_recipe(tmp_path)
-    assert recipe.recipe_type == RecipeType.SPECULATIVE_EAGLE
-    assert isinstance(recipe, ModelOptEagleRecipe)
-    assert recipe.description == "Dir eagle test."
-    assert recipe.eagle.eagle_ttt_steps == 5
-    assert recipe.eagle.eagle_use_torch_compile is False
-
-
 def test_load_recipe_eagle_missing_section_raises(tmp_path):
     """load_recipe raises ValueError when 'eagle' is absent for a SPECULATIVE_EAGLE recipe."""
     bad = tmp_path / "bad.yml"
@@ -259,22 +243,6 @@ def test_load_recipe_dflash_builtin():
     # Full-pipeline recipe also carries typed HF trainer sections.
     assert recipe.training.mode == "dflash"
     assert recipe.training.training_seq_len == 4096
-
-
-def test_load_recipe_dflash_dir(tmp_path):
-    """load_recipe loads a DFlash recipe from a directory with recipe.yml + dflash.yml."""
-    (tmp_path / "recipe.yml").write_text(
-        "metadata:\n  recipe_type: speculative_dflash\n  description: Dir dflash test.\n"
-    )
-    (tmp_path / "dflash.yml").write_text(
-        "dflash_block_size: 16\ndflash_loss_decay_factor: 7.0\ndflash_use_torch_compile: false\n"
-    )
-    recipe = load_recipe(tmp_path)
-    assert recipe.recipe_type == RecipeType.SPECULATIVE_DFLASH
-    assert isinstance(recipe, ModelOptDFlashRecipe)
-    assert recipe.description == "Dir dflash test."
-    assert recipe.dflash.dflash_block_size == 16
-    assert recipe.dflash.dflash_loss_decay_factor == 7.0
 
 
 def test_load_recipe_dflash_missing_section_raises(tmp_path):

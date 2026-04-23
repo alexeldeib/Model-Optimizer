@@ -62,10 +62,11 @@ def load_recipe(recipe_path: str | Path | Traversable) -> ModelOptRecipeBase:
     ``recipe_path`` can be:
 
     * A ``.yml`` / ``.yaml`` file with ``metadata`` and one of ``quantize`` (PTQ),
-      ``eagle`` (EAGLE speculative decoding) or ``dflash`` (DFlash speculative
-      decoding) sections. The suffix may be omitted and will be probed automatically.
-    * A directory containing ``recipe.yml`` (metadata) plus ``quantize.yml``,
-      ``eagle.yml`` or ``dflash.yml`` depending on ``recipe_type``.
+      ``eagle`` (EAGLE speculative decoding), ``dflash`` (DFlash speculative
+      decoding) or ``medusa`` (Medusa speculative decoding) sections. The suffix
+      may be omitted and will be probed automatically.
+    * A directory containing ``recipe.yml`` (metadata) plus ``quantize.yml`` —
+      **PTQ recipes only**. Speculative-decoding recipes are always single YAML files.
 
     The path may be relative to the built-in recipes library or an absolute /
     relative filesystem path.
@@ -189,53 +190,5 @@ def _load_recipe_from_dir(recipe_dir: Path | Traversable) -> ModelOptRecipeBase:
             recipe_type=RecipeType.PTQ,
             description=metadata.get("description", "PTQ recipe."),
             quantize=load_config(quantize_file),
-        )
-    if recipe_type == RecipeType.SPECULATIVE_EAGLE:
-        eagle_file = None
-        for name in ("eagle.yml", "eagle.yaml"):
-            candidate = recipe_dir.joinpath(name)
-            if candidate.is_file():
-                eagle_file = candidate
-                break
-        if eagle_file is None:
-            raise ValueError(
-                f"Cannot find eagle in {recipe_dir}. Looked for: eagle.yml, eagle.yaml"
-            )
-        return ModelOptEagleRecipe(
-            recipe_type=RecipeType.SPECULATIVE_EAGLE,
-            description=metadata.get("description", "EAGLE speculative decoding recipe."),
-            eagle=load_config(eagle_file),
-        )
-    if recipe_type == RecipeType.SPECULATIVE_DFLASH:
-        dflash_file = None
-        for name in ("dflash.yml", "dflash.yaml"):
-            candidate = recipe_dir.joinpath(name)
-            if candidate.is_file():
-                dflash_file = candidate
-                break
-        if dflash_file is None:
-            raise ValueError(
-                f"Cannot find dflash in {recipe_dir}. Looked for: dflash.yml, dflash.yaml"
-            )
-        return ModelOptDFlashRecipe(
-            recipe_type=RecipeType.SPECULATIVE_DFLASH,
-            description=metadata.get("description", "DFlash speculative decoding recipe."),
-            dflash=load_config(dflash_file),
-        )
-    if recipe_type == RecipeType.SPECULATIVE_MEDUSA:
-        medusa_file = None
-        for name in ("medusa.yml", "medusa.yaml"):
-            candidate = recipe_dir.joinpath(name)
-            if candidate.is_file():
-                medusa_file = candidate
-                break
-        if medusa_file is None:
-            raise ValueError(
-                f"Cannot find medusa in {recipe_dir}. Looked for: medusa.yml, medusa.yaml"
-            )
-        return ModelOptMedusaRecipe(
-            recipe_type=RecipeType.SPECULATIVE_MEDUSA,
-            description=metadata.get("description", "Medusa speculative decoding recipe."),
-            medusa=load_config(medusa_file),
         )
     raise ValueError(f"Unsupported recipe type: {recipe_type!r}")
