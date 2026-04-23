@@ -36,7 +36,6 @@ from typing import Literal
 
 import torch
 import transformers
-from accelerate import ParallelismConfig
 from eagle_utils import (
     EagleTrainerWithAccLog,
     EagleTrainingPlot,
@@ -44,6 +43,7 @@ from eagle_utils import (
     make_speculative_data_module,
     patch_ring_attention_for_ttt,
 )
+from rich.pretty import pprint
 from transformers.trainer_utils import get_last_checkpoint
 
 import modelopt.torch.opt as mto
@@ -53,6 +53,7 @@ from modelopt.recipe.config import ModelOptDFlashRecipe, ModelOptEagleRecipe, Mo
 from modelopt.torch.speculative.config import EagleConfig
 from modelopt.torch.speculative.utils import load_vlm_or_llm, patch_transformers5_params_loading
 from modelopt.torch.utils import print_rank_0
+from modelopt.torch.utils.distributed import is_master
 
 torch.manual_seed(0)
 mto.enable_huggingface_checkpointing()
@@ -95,66 +96,22 @@ def _parse_cli() -> tuple[str, list[str]]:
     return args.config, overrides
 
 
-_SUPPORTED_RECIPES = (ModelOptEagleRecipe, ModelOptDFlashRecipe, ModelOptMedusaRecipe)
-
-
 def train():
     config_path, overrides = _parse_cli()
     recipe = load_recipe(config_path, overrides=overrides)
-    if not isinstance(recipe, _SUPPORTED_RECIPES):
-        raise ValueError(
-            f"--config expected an EAGLE / DFlash / Medusa recipe, got "
-            f"{type(recipe).__name__} from {config_path}"
-        )
 
     # Pydantic-typed sections flow straight through as *_args; only TrainingArguments is
     # reconstructed as an HF dataclass so it can be handed to transformers.Trainer.
     model_args = recipe.model
     data_args = recipe.data
+    training_args = HfTrainingArguments(**recipe.training.model_dump())
 
-    training_dict = recipe.training.model_dump()
-    if training_dict.get("dp_shard_size") is None:
-        cp_size = training_dict.get("cp_size", 1)
-        # Use WORLD_SIZE (total GPUs across all nodes) when available, else local GPU count.
-        world_size = int(os.environ.get("WORLD_SIZE", torch.cuda.device_count()))
-        training_dict["dp_shard_size"] = world_size // cp_size
-    training_args = HfTrainingArguments(**training_dict)
-
-    eagle_cfg: dict = recipe.eagle.model_dump() if isinstance(recipe, ModelOptEagleRecipe) else {}
-    dflash_cfg: dict = (
-        recipe.dflash.model_dump() if isinstance(recipe, ModelOptDFlashRecipe) else {}
-    )
-
-    if not data_args.data_path and not data_args.offline_data_path:
-        raise ValueError(
-            "Either data.data_path or data.offline_data_path must be set in the config."
-        )
-    if training_args.cp_size > 1 or training_args.dp_shard_size > 1:
-        # Auto-compute dp_replicate_size so that
-        # dp_replicate_size * dp_shard_size * cp_size == world_size.
-        # Note: torch.cuda.device_count() returns per-node GPU count, not world_size.
-        # WORLD_SIZE (set by torchrun/accelerate) gives the correct multi-node total.
-        world_size = int(os.environ.get("WORLD_SIZE", torch.cuda.device_count()))
-        parallel_size = training_args.dp_shard_size * training_args.cp_size
-        if world_size % parallel_size != 0:
-            raise ValueError(
-                f"world_size ({world_size}) must be divisible by "
-                f"dp_shard_size ({training_args.dp_shard_size}) * cp_size ({training_args.cp_size}) "
-                f"= {parallel_size}"
-            )
-        dp_replicate_size = world_size // parallel_size
-        training_args.parallelism_config = ParallelismConfig(
-            cp_size=training_args.cp_size,
-            dp_shard_size=training_args.dp_shard_size,
-            dp_replicate_size=dp_replicate_size,
-        )
     if training_args.cp_size > 1:
         patch_ring_attention_for_ttt()
         # Specific patch to accelerate 1.12.0. Removable after move to 1.13.0
         training_args.parallelism_config.sp_backend = None
-    print_rank_0(
-        f"arguments: {model_args}, {training_args}, eagle_cfg={eagle_cfg}, dflash_cfg={dflash_cfg}"
-    )
+    if is_master():
+        pprint(recipe)
 
     # Detect checkpoint to resume from
     last_checkpoint = (
@@ -178,20 +135,8 @@ def train():
             checkpoint, trust_remote_code=model_args.trust_remote_code
         )
     else:
-        if model_args.model_name_or_path is None:
-            raise ValueError(
-                "model.model_name_or_path is required when no checkpoint is resumed. "
-                "Set it in the recipe YAML or pass model.model_name_or_path=<path> on the CLI."
-            )
         # To avoid OOM for large models, we load and convert model on CPU first.
         # Model will be moved to GPU during HF trainer.init().
-        if use_offline_training:
-            # Load config first to preserve original num_hidden_layers before
-            # load_vlm_or_llm may reduce layers for offline space savings.
-            model_config = transformers.AutoConfig.from_pretrained(
-                model_args.model_name_or_path,
-                trust_remote_code=model_args.trust_remote_code,
-            )
         model = load_vlm_or_llm(
             model_args.model_name_or_path,
             use_fake_base=model_args.use_fake_base_for_offline,
@@ -200,34 +145,19 @@ def train():
             device_map="cpu",
             trust_remote_code=model_args.trust_remote_code,
         )
-        if use_offline_training:
-            # When doing offline training, we need to set num_hidden_layers
-            # since we override it when loading the model for space savings.
-            # Some models (e.g. Kimi-K2.5) use non-standard config attributes,
-            # so fall back to the model's own config if the attribute is missing.
-            model.config.num_orig_hidden_layers = getattr(
-                model_config, "num_hidden_layers", model.config.num_hidden_layers
-            )
-            if hasattr(model.config, "layer_types"):
-                del (
-                    model.config.layer_types
-                )  # remove layer_types to avoid mismatch with the modified model
         tokenizer = transformers.AutoTokenizer.from_pretrained(
             model_args.model_name_or_path,
             model_max_length=training_args.training_seq_len,
             trust_remote_code=model_args.trust_remote_code,
         )
         if training_args.mode == "medusa":
-            if not isinstance(recipe, ModelOptMedusaRecipe):
-                raise ValueError(
-                    f"training.mode='medusa' requires a speculative_medusa recipe, got "
-                    f"{type(recipe).__name__}"
-                )
+            assert isinstance(recipe, ModelOptMedusaRecipe)
             mtsp.convert(model, [("medusa", recipe.medusa.model_dump())])
         elif training_args.mode == "eagle3":
             # Validate and rewrite eagle config fields
+            assert isinstance(recipe, ModelOptEagleRecipe)
             eagle_cfg = EagleConfig.model_validate(
-                eagle_cfg,
+                recipe.eagle.model_dump(),
                 context={"training_args": training_args, "data_args": data_args},
             ).model_dump()
             mtsp.convert(model, [("eagle", eagle_cfg)])
@@ -243,6 +173,8 @@ def train():
                 model.eagle_module.d2t = torch.load(data_args.draft_vocab_cache, weights_only=True)
                 print_rank_0(f"Loaded draft vocab cache from {data_args.draft_vocab_cache}.")
         elif training_args.mode == "dflash":
+            assert isinstance(recipe, ModelOptDFlashRecipe)
+            dflash_cfg = recipe.dflash.model_dump()
             # Auto-detect mask_token_id from tokenizer if not set
             if not dflash_cfg.get("dflash_mask_token_id"):
                 if tokenizer.mask_token_id is not None:

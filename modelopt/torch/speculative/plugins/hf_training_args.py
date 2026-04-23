@@ -26,13 +26,19 @@ The module intentionally does NOT import ``transformers`` — it is pure Pydanti
 compatible with HF's ``Trainer`` API; the ``TrainingArguments`` model here only declares the
 seven speculative-decoding extension fields plus ``extra='allow'`` so HF trainer fields
 (learning_rate, num_train_epochs, ...) flow through untouched.
+
+``TrainingArguments`` does read ``WORLD_SIZE`` and ``torch.cuda.device_count()`` at validation
+time to auto-fill ``dp_shard_size`` and derive a ``parallelism_config`` (accelerate's
+``ParallelismConfig``) when the run is actually distributed. ``torch`` and ``accelerate`` are
+imported lazily from within the validator so importing this module stays cheap and
+``accelerate`` only becomes a hard requirement when ``cp_size>1`` or ``dp_shard_size>1``.
 """
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 
 class ModelArguments(BaseModel):
@@ -66,6 +72,14 @@ class DataArguments(BaseModel):
             raise ValueError("sample_size must be -1 (use all samples) or a positive integer")
         return v
 
+    @model_validator(mode="after")
+    def _require_a_data_source(self) -> DataArguments:
+        if not self.data_path and not self.offline_data_path:
+            raise ValueError(
+                "Either data.data_path or data.offline_data_path must be set in the config."
+            )
+        return self
+
 
 class TrainingArguments(BaseModel):
     """Speculative-decoding extensions on top of ``transformers.TrainingArguments``.
@@ -84,3 +98,42 @@ class TrainingArguments(BaseModel):
     answer_only_loss: bool = False
     cp_size: int = 1
     dp_shard_size: int | None = None
+    # Derived at validation time from cp_size/dp_shard_size/WORLD_SIZE; typed as Any so this
+    # module doesn't need to import accelerate.ParallelismConfig just to annotate the field.
+    parallelism_config: Any = None
+
+    @model_validator(mode="after")
+    def _fill_parallelism(self) -> TrainingArguments:
+        # Read WORLD_SIZE (set by torchrun/accelerate, multi-node aware); fall back to the
+        # local GPU count for single-process runs.
+        import os
+
+        import torch
+
+        world_size = int(os.environ.get("WORLD_SIZE", torch.cuda.device_count()))
+        if self.dp_shard_size is None:
+            self.dp_shard_size = world_size // self.cp_size
+
+        # Build a ParallelismConfig only when actually running distributed — matches the
+        # previous main.py guard and avoids requiring accelerate on single-GPU dev boxes.
+        if self.cp_size > 1 or self.dp_shard_size > 1:
+            parallel_size = self.dp_shard_size * self.cp_size
+            if world_size % parallel_size != 0:
+                raise ValueError(
+                    f"world_size ({world_size}) must be divisible by "
+                    f"dp_shard_size ({self.dp_shard_size}) * cp_size ({self.cp_size}) "
+                    f"= {parallel_size}"
+                )
+            try:
+                from accelerate import ParallelismConfig
+            except ImportError as e:
+                raise ImportError(
+                    "cp_size>1 or dp_shard_size>1 requires `accelerate` for ParallelismConfig. "
+                    "Install it via `pip install accelerate`."
+                ) from e
+            self.parallelism_config = ParallelismConfig(
+                cp_size=self.cp_size,
+                dp_shard_size=self.dp_shard_size,
+                dp_replicate_size=world_size // parallel_size,
+            )
+        return self
