@@ -22,7 +22,13 @@ except ImportError:  # Python < 3.11
 from pathlib import Path
 
 from ._config_loader import BUILTIN_RECIPES_LIB, load_config
-from .config import ModelOptEagleRecipe, ModelOptPTQRecipe, ModelOptRecipeBase, RecipeType
+from .config import (
+    ModelOptDFlashRecipe,
+    ModelOptEagleRecipe,
+    ModelOptPTQRecipe,
+    ModelOptRecipeBase,
+    RecipeType,
+)
 
 __all__ = ["load_config", "load_recipe"]
 
@@ -54,11 +60,11 @@ def load_recipe(recipe_path: str | Path | Traversable) -> ModelOptRecipeBase:
 
     ``recipe_path`` can be:
 
-    * A ``.yml`` / ``.yaml`` file with ``metadata`` and one of ``quantize`` (PTQ)
-      or ``eagle`` (EAGLE speculative decoding) sections. The suffix may be
-      omitted and will be probed automatically.
-    * A directory containing ``recipe.yml`` (metadata) plus ``quantize.yml`` or
-      ``eagle.yml`` depending on ``recipe_type``.
+    * A ``.yml`` / ``.yaml`` file with ``metadata`` and one of ``quantize`` (PTQ),
+      ``eagle`` (EAGLE speculative decoding) or ``dflash`` (DFlash speculative
+      decoding) sections. The suffix may be omitted and will be probed automatically.
+    * A directory containing ``recipe.yml`` (metadata) plus ``quantize.yml``,
+      ``eagle.yml`` or ``dflash.yml`` depending on ``recipe_type``.
 
     The path may be relative to the built-in recipes library or an absolute /
     relative filesystem path.
@@ -110,6 +116,14 @@ def _load_recipe_from_file(recipe_file: Path | Traversable) -> ModelOptRecipeBas
             recipe_type=RecipeType.SPECULATIVE_EAGLE,
             description=metadata.get("description", "EAGLE speculative decoding recipe."),
             eagle=data["eagle"],
+        )
+    if recipe_type == RecipeType.SPECULATIVE_DFLASH:
+        if "dflash" not in data:
+            raise ValueError(f"DFlash recipe file {recipe_file} must contain 'dflash'.")
+        return ModelOptDFlashRecipe(
+            recipe_type=RecipeType.SPECULATIVE_DFLASH,
+            description=metadata.get("description", "DFlash speculative decoding recipe."),
+            dflash=data["dflash"],
         )
     raise ValueError(f"Unsupported recipe type: {recipe_type!r}")
 
@@ -163,5 +177,21 @@ def _load_recipe_from_dir(recipe_dir: Path | Traversable) -> ModelOptRecipeBase:
             recipe_type=RecipeType.SPECULATIVE_EAGLE,
             description=metadata.get("description", "EAGLE speculative decoding recipe."),
             eagle=load_config(eagle_file),
+        )
+    if recipe_type == RecipeType.SPECULATIVE_DFLASH:
+        dflash_file = None
+        for name in ("dflash.yml", "dflash.yaml"):
+            candidate = recipe_dir.joinpath(name)
+            if candidate.is_file():
+                dflash_file = candidate
+                break
+        if dflash_file is None:
+            raise ValueError(
+                f"Cannot find dflash in {recipe_dir}. Looked for: dflash.yml, dflash.yaml"
+            )
+        return ModelOptDFlashRecipe(
+            recipe_type=RecipeType.SPECULATIVE_DFLASH,
+            description=metadata.get("description", "DFlash speculative decoding recipe."),
+            dflash=load_config(dflash_file),
         )
     raise ValueError(f"Unsupported recipe type: {recipe_type!r}")

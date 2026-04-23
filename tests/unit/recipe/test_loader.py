@@ -19,7 +19,12 @@ import re
 
 import pytest
 
-from modelopt.recipe.config import ModelOptEagleRecipe, ModelOptPTQRecipe, RecipeType
+from modelopt.recipe.config import (
+    ModelOptDFlashRecipe,
+    ModelOptEagleRecipe,
+    ModelOptPTQRecipe,
+    RecipeType,
+)
 from modelopt.recipe.loader import load_config, load_recipe
 
 # ---------------------------------------------------------------------------
@@ -231,6 +236,54 @@ def test_load_recipe_eagle_field_validation_raises(tmp_path):
     bad = tmp_path / "bad.yml"
     bad.write_text(
         "metadata:\n  recipe_type: speculative_eagle\neagle:\n  eagle_ttt_steps: not_an_int\n"
+    )
+    with pytest.raises(Exception):  # pydantic.ValidationError
+        load_recipe(bad)
+
+
+# ---------------------------------------------------------------------------
+# load_recipe — DFlash speculative decoding
+# ---------------------------------------------------------------------------
+
+
+def test_load_recipe_dflash_builtin():
+    """load_recipe loads the built-in DFlash recipe and returns a ModelOptDFlashRecipe."""
+    recipe = load_recipe("general/speculative_decoding/dflash_recipe")
+    assert recipe.recipe_type == RecipeType.SPECULATIVE_DFLASH
+    assert isinstance(recipe, ModelOptDFlashRecipe)
+    assert recipe.dflash.dflash_block_size == 8
+    assert recipe.dflash.dflash_num_anchors == 512
+
+
+def test_load_recipe_dflash_dir(tmp_path):
+    """load_recipe loads a DFlash recipe from a directory with recipe.yml + dflash.yml."""
+    (tmp_path / "recipe.yml").write_text(
+        "metadata:\n  recipe_type: speculative_dflash\n  description: Dir dflash test.\n"
+    )
+    (tmp_path / "dflash.yml").write_text(
+        "dflash_block_size: 16\ndflash_loss_decay_factor: 7.0\ndflash_use_torch_compile: false\n"
+    )
+    recipe = load_recipe(tmp_path)
+    assert recipe.recipe_type == RecipeType.SPECULATIVE_DFLASH
+    assert isinstance(recipe, ModelOptDFlashRecipe)
+    assert recipe.description == "Dir dflash test."
+    assert recipe.dflash.dflash_block_size == 16
+    assert recipe.dflash.dflash_loss_decay_factor == 7.0
+
+
+def test_load_recipe_dflash_missing_section_raises(tmp_path):
+    """load_recipe raises ValueError when 'dflash' is absent for a SPECULATIVE_DFLASH recipe."""
+    bad = tmp_path / "bad.yml"
+    bad.write_text("metadata:\n  recipe_type: speculative_dflash\n")
+    with pytest.raises(ValueError, match="dflash"):
+        load_recipe(bad)
+
+
+def test_load_recipe_dflash_field_validation_raises(tmp_path):
+    """Invalid DFlash field values must fail Pydantic validation at load time."""
+    bad = tmp_path / "bad.yml"
+    bad.write_text(
+        "metadata:\n  recipe_type: speculative_dflash\ndflash:\n  dflash_block_size: not_an_int\n"
     )
     with pytest.raises(Exception):  # pydantic.ValidationError
         load_recipe(bad)

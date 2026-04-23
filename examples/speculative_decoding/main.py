@@ -50,7 +50,7 @@ from transformers.trainer_utils import get_last_checkpoint
 import modelopt.torch.opt as mto
 import modelopt.torch.speculative as mtsp
 from modelopt.recipe import load_recipe
-from modelopt.recipe.config import ModelOptEagleRecipe
+from modelopt.recipe.config import ModelOptDFlashRecipe, ModelOptEagleRecipe
 from modelopt.torch.speculative.config import EagleConfig
 from modelopt.torch.speculative.utils import load_vlm_or_llm, patch_transformers5_params_loading
 from modelopt.torch.utils import print_rank_0
@@ -158,8 +158,9 @@ def _parse_cli() -> tuple[str, str | None, list[str]]:
         "--recipe",
         default=None,
         help=(
-            "Optional modelopt recipe name or path for the EAGLE config. "
-            "When set, the 'eagle' section from --config is ignored and this recipe is used instead."
+            "Optional modelopt recipe name or path for the speculative-decoding config. "
+            "Supports EAGLE (speculative_eagle) and DFlash (speculative_dflash) recipes. "
+            "When set, the matching section from --config is ignored and this recipe is used instead."
         ),
     )
     args, overrides = p.parse_known_args()
@@ -174,9 +175,9 @@ def _load_config(
     *overrides* are OmegaConf dotlist entries (e.g. ``["model.model_name_or_path=xxx"]``)
     applied on top of the YAML.
 
-    When *recipe_path* is provided, the eagle section is sourced from the recipe instead of
-    from the YAML file — the recipe goes through ``modelopt.recipe.load_recipe`` and yields a
-    ``ModelOptEagleRecipe``.
+    When *recipe_path* is provided, the matching section is sourced from the recipe instead
+    of from the YAML file — the recipe goes through ``modelopt.recipe.load_recipe`` and yields
+    either a ``ModelOptEagleRecipe`` or ``ModelOptDFlashRecipe``.
 
     Returns:
         hf_cfg: Flat dict from model/data/training sections, for HfArgumentParser.parse_dict()
@@ -188,16 +189,19 @@ def _load_config(
         merged = OmegaConf.merge(merged, OmegaConf.from_dotlist(list(overrides)))
     cfg = OmegaConf.to_container(merged, resolve=True)
 
+    eagle_cfg = cfg.get("eagle", {})
+    dflash_cfg = cfg.get("dflash", {})
     if recipe_path is not None:
         recipe = load_recipe(recipe_path)
-        if not isinstance(recipe, ModelOptEagleRecipe):
+        if isinstance(recipe, ModelOptEagleRecipe):
+            eagle_cfg = recipe.eagle.model_dump()
+        elif isinstance(recipe, ModelOptDFlashRecipe):
+            dflash_cfg = recipe.dflash.model_dump()
+        else:
             raise ValueError(
-                f"--recipe expected an EAGLE recipe, got {type(recipe).__name__} from {recipe_path}"
+                f"--recipe expected an EAGLE or DFlash recipe, got "
+                f"{type(recipe).__name__} from {recipe_path}"
             )
-        eagle_cfg = recipe.eagle.model_dump()
-    else:
-        eagle_cfg = cfg.get("eagle", {})
-    dflash_cfg = cfg.get("dflash", {})
 
     hf_cfg = {
         **cfg.get("model", {}),

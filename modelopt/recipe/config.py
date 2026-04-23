@@ -23,7 +23,7 @@ from pydantic import field_validator
 
 from modelopt.torch.opt.config import ModeloptBaseConfig, ModeloptField
 from modelopt.torch.quantization.config import QuantizeConfig
-from modelopt.torch.speculative.config import EagleConfig
+from modelopt.torch.speculative.config import DFlashConfig, EagleConfig
 
 
 class RecipeType(str, Enum):
@@ -31,6 +31,7 @@ class RecipeType(str, Enum):
 
     PTQ = "ptq"
     SPECULATIVE_EAGLE = "speculative_eagle"
+    SPECULATIVE_DFLASH = "speculative_dflash"
     # QAT = "qat" # Not implemented yet, will be added in the future.
 
 
@@ -83,5 +84,16 @@ class ModelOptEagleRecipe(ModelOptRecipeBase):
         default=EagleConfig(),
         title="EAGLE config",
         description="EAGLE speculative decoding configuration.",
+        validate_default=True,
+    )
+
+
+class ModelOptDFlashRecipe(ModelOptRecipeBase):
+    """Our config class for DFlash speculative decoding recipes."""
+
+    dflash: DFlashConfig = ModeloptField(
+        default=DFlashConfig(),
+        title="DFlash config",
+        description="DFlash speculative decoding configuration.",
         validate_default=True,
     )
