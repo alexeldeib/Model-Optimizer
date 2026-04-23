@@ -32,7 +32,6 @@
 import argparse
 import os
 from dataclasses import dataclass
-from typing import Literal
 
 import torch
 import transformers
@@ -69,7 +68,6 @@ class HfTrainingArguments(transformers.TrainingArguments):
     """
 
     training_seq_len: int = 2048
-    mode: Literal["eagle3", "medusa", "dflash"] = "eagle3"
     estimate_ar: bool = False
     ar_validate_steps: int = 1000
     answer_only_loss: bool = False
@@ -102,10 +100,12 @@ def train():
 
     # Pydantic-typed sections flow straight through as *_args; only TrainingArguments is
     # reconstructed as an HF dataclass so it can be handed to transformers.Trainer.
-    model_args = recipe.model
-    data_args = recipe.data
     training_args = HfTrainingArguments(**recipe.training.model_dump())
 
+    if not recipe.data.data_path and not recipe.data.offline_data_path:
+        raise ValueError(
+            "Either data.data_path or data.offline_data_path must be set in the config."
+        )
     if training_args.cp_size > 1:
         patch_ring_attention_for_ttt()
         # Specific patch to accelerate 1.12.0. Removable after move to 1.13.0
@@ -124,56 +124,50 @@ def train():
 
     checkpoint = training_args.resume_from_checkpoint or last_checkpoint
 
-    use_offline_training = data_args.offline_data_path is not None
+    use_offline_training = recipe.data.offline_data_path is not None
 
     if checkpoint:
         with patch_transformers5_params_loading():
             model = load_vlm_or_llm(
-                checkpoint, dtype="auto", trust_remote_code=model_args.trust_remote_code
+                checkpoint, dtype="auto", trust_remote_code=recipe.model.trust_remote_code
             )
         tokenizer = transformers.AutoTokenizer.from_pretrained(
-            checkpoint, trust_remote_code=model_args.trust_remote_code
+            checkpoint, trust_remote_code=recipe.model.trust_remote_code
         )
     else:
         # To avoid OOM for large models, we load and convert model on CPU first.
         # Model will be moved to GPU during HF trainer.init().
         model = load_vlm_or_llm(
-            model_args.model_name_or_path,
-            use_fake_base=model_args.use_fake_base_for_offline,
+            recipe.model.model_name_or_path,
+            use_fake_base=recipe.model.use_fake_base_for_offline,
             use_offline_training=use_offline_training,
             dtype="auto",
             device_map="cpu",
-            trust_remote_code=model_args.trust_remote_code,
+            trust_remote_code=recipe.model.trust_remote_code,
         )
         tokenizer = transformers.AutoTokenizer.from_pretrained(
-            model_args.model_name_or_path,
+            recipe.model.model_name_or_path,
             model_max_length=training_args.training_seq_len,
-            trust_remote_code=model_args.trust_remote_code,
+            trust_remote_code=recipe.model.trust_remote_code,
         )
-        if training_args.mode == "medusa":
-            assert isinstance(recipe, ModelOptMedusaRecipe)
+        if isinstance(recipe, ModelOptMedusaRecipe):
             mtsp.convert(model, [("medusa", recipe.medusa.model_dump())])
-        elif training_args.mode == "eagle3":
+        elif isinstance(recipe, ModelOptEagleRecipe):
             # Validate and rewrite eagle config fields
-            assert isinstance(recipe, ModelOptEagleRecipe)
             eagle_cfg = EagleConfig.model_validate(
                 recipe.eagle.model_dump(),
-                context={"training_args": training_args, "data_args": data_args},
+                context={"training_args": training_args, "data_args": recipe.data},
             ).model_dump()
             mtsp.convert(model, [("eagle", eagle_cfg)])
 
             # Load draft vocab cache if the draft model uses a compressed vocabulary
             if model.eagle_config.draft_vocab_size < model.eagle_config.vocab_size:
-                if data_args.draft_vocab_cache is None or not os.path.isfile(
-                    data_args.draft_vocab_cache
-                ):
-                    raise FileNotFoundError(
-                        f"Draft vocab cache provided but not found: {data_args.draft_vocab_cache}"
-                    )
-                model.eagle_module.d2t = torch.load(data_args.draft_vocab_cache, weights_only=True)
-                print_rank_0(f"Loaded draft vocab cache from {data_args.draft_vocab_cache}.")
-        elif training_args.mode == "dflash":
-            assert isinstance(recipe, ModelOptDFlashRecipe)
+                d2t = recipe.data.draft_vocab_cache
+                if d2t is None or not os.path.isfile(d2t):
+                    raise FileNotFoundError(f"Draft vocab cache provided but not found: {d2t}")
+                model.eagle_module.d2t = torch.load(d2t, weights_only=True)
+                print_rank_0(f"Loaded draft vocab cache from {d2t}.")
+        elif isinstance(recipe, ModelOptDFlashRecipe):
             dflash_cfg = recipe.dflash.model_dump()
             # Auto-detect mask_token_id from tokenizer if not set
             if not dflash_cfg.get("dflash_mask_token_id"):
@@ -189,7 +183,7 @@ def train():
                     )
             mtsp.convert(model, [("dflash", dflash_cfg)])
         else:
-            raise Exception(f"{training_args.mode} is not supported!")
+            raise ValueError(f"Unsupported speculative recipe type: {type(recipe).__name__}")
 
     # Move any remaining CPU buffers to CUDA so DDP (NCCL-only) can broadcast
     # them.  We iterate named_buffers and reassign via the owning module to
@@ -206,11 +200,11 @@ def train():
                 setattr(mod, parts[-1], buf.to(_target_dev))
 
     print_rank_0("Loading dataset...")
-    is_dflash = training_args.mode == "dflash"
-    if training_args.mode in ("eagle3", "dflash"):
+    is_dflash = isinstance(recipe, ModelOptDFlashRecipe)
+    if isinstance(recipe, (ModelOptEagleRecipe, ModelOptDFlashRecipe)):
         data_module = make_speculative_data_module(
             tokenizer,
-            data_args,
+            recipe.data,
             train_len=training_args.training_seq_len,
             answer_only_loss=training_args.answer_only_loss,
             shift_labels=not is_dflash,

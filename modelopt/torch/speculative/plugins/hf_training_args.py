@@ -36,7 +36,7 @@ imported lazily from within the validator so importing this module stays cheap a
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
@@ -72,14 +72,6 @@ class DataArguments(BaseModel):
             raise ValueError("sample_size must be -1 (use all samples) or a positive integer")
         return v
 
-    @model_validator(mode="after")
-    def _require_a_data_source(self) -> DataArguments:
-        if not self.data_path and not self.offline_data_path:
-            raise ValueError(
-                "Either data.data_path or data.offline_data_path must be set in the config."
-            )
-        return self
-
 
 class TrainingArguments(BaseModel):
     """Speculative-decoding extensions on top of ``transformers.TrainingArguments``.
@@ -92,7 +84,6 @@ class TrainingArguments(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     training_seq_len: int = 2048
-    mode: Literal["eagle3", "medusa", "dflash"] = "eagle3"
     estimate_ar: bool = False
     ar_validate_steps: int = 1000
     answer_only_loss: bool = False

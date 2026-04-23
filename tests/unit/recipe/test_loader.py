@@ -206,7 +206,6 @@ def test_load_recipe_eagle_builtin():
     assert recipe.eagle.eagle_decoder_type == "llama"
     assert recipe.eagle.eagle_ttt_steps == 3
     # Full-pipeline recipe also carries typed HF trainer sections.
-    assert recipe.training.mode == "eagle3"
     assert recipe.training.training_seq_len == 2048
 
 
@@ -241,7 +240,6 @@ def test_load_recipe_dflash_builtin():
     assert recipe.dflash.dflash_block_size == 8
     assert recipe.dflash.dflash_num_anchors == 512
     # Full-pipeline recipe also carries typed HF trainer sections.
-    assert recipe.training.mode == "dflash"
     assert recipe.training.training_seq_len == 4096
 
 
@@ -260,16 +258,15 @@ def test_load_recipe_eagle_with_training_sections(tmp_path):
         "metadata:\n  recipe_type: speculative_eagle\n"
         "model:\n  model_name_or_path: TinyLlama/TinyLlama-1.1B-Chat-v1.0\n"
         "data:\n  data_path: train.jsonl\n"
-        "training:\n  mode: eagle3\n  output_dir: ckpts/test\n"
+        "training:\n  output_dir: ckpts/test\n"
         "eagle:\n  eagle_decoder_type: llama\n  eagle_ttt_steps: 2\n"
     )
     recipe = load_recipe(recipe_path)
     assert isinstance(recipe, ModelOptEagleRecipe)
     assert recipe.model.model_name_or_path == "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     assert recipe.data.data_path == "train.jsonl"
-    # output_dir is an HF-trainer extra (not one of our 7 extension fields); flows through extras.
+    # output_dir is an HF-trainer extra; flows through extras.
     assert recipe.training.model_dump()["output_dir"] == "ckpts/test"
-    assert recipe.training.mode == "eagle3"
     assert recipe.eagle.eagle_ttt_steps == 2
 
 
@@ -291,7 +288,6 @@ def test_typed_training_section_accepts_hf_extras(tmp_path):
     recipe_path.write_text(
         "metadata:\n  recipe_type: speculative_eagle\n"
         "training:\n"
-        "  mode: eagle3\n"
         "  num_train_epochs: 3\n"  # HF field — accepted as extra
         "  learning_rate: 1.0e-4\n"  # HF field — accepted as extra
         "  training_seq_len: 4096\n"  # our extension field — validated
