@@ -31,7 +31,7 @@
 
 import argparse
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal
 
 import torch
@@ -60,90 +60,21 @@ mto.enable_huggingface_checkpointing()
 
 
 @dataclass
-class ModelArguments:
-    model_name_or_path: str | None = field(
-        default="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-        metadata={"help": "HuggingFace model ID or local path to the base model."},
-    )
-    use_fake_base_for_offline: bool = field(
-        default=False,
-        metadata={
-            "help": "Load model architecture without real base weights. Offline training only."
-        },
-    )
-    trust_remote_code: bool = field(
-        default=False, metadata={"help": "Trust remote code when loading model."}
-    )
+class HfTrainingArguments(transformers.TrainingArguments):
+    """HF-compatible TrainingArguments with our speculative-decoding extensions.
 
+    Used only to build the ``transformers.Trainer``-compatible object at runtime via
+    ``HfTrainingArguments(**recipe.training.model_dump())``. Field set MUST stay in sync
+    with :class:`modelopt.torch.speculative.plugins.hf_training_args.TrainingArguments`.
+    """
 
-@dataclass
-class DataArguments:
-    data_path: str = field(
-        default=None,
-        metadata={"help": "Path to the online training data."},
-    )
-    offline_data_path: str = field(
-        default=None,
-        metadata={
-            "help": "Path to offline training data directory (.pt files). This argument enables offline mode.",
-        },
-    )
-    lazy_preprocess: bool = True
-    draft_vocab_cache: str | None = field(
-        default=None,
-        metadata={"help": "Path to draft vocabulary cache file."},
-    )
-    chat_template: str = field(
-        default=None,
-        metadata={
-            "help": "Jinja chat template with {% generation %} tags for answer_only_loss. "
-            "If not set, the tokenizer's built-in template is used (must already have generation tags)."
-        },
-    )
-    vlm_img_dir: str = field(default=None, metadata={"help": "Path to the VLM image directory."})
-    vlm_processor: str = field(default=None, metadata={"help": "Path to the VLM processor."})
-    sample_size: int = field(
-        default=-1,
-        metadata={"help": "Number of samples to use for training. Use -1 to use all samples."},
-    )
-
-    def __post_init__(self):
-        if self.sample_size == 0 or self.sample_size < -1:
-            raise ValueError("sample_size must be -1 (use all samples) or a positive integer")
-
-
-@dataclass
-class TrainingArguments(transformers.TrainingArguments):
-    training_seq_len: int = field(
-        default=2048,
-        metadata={
-            "help": (
-                "Training sequence length. Sequences will be right padded or truncated to this length."
-            )
-        },
-    )
+    training_seq_len: int = 2048
     mode: Literal["eagle3", "medusa", "dflash"] = "eagle3"
-    estimate_ar: bool = field(
-        default=False, metadata={"help": "Whether to estimate AR using training accuracy to log."}
-    )
-    ar_validate_steps: int = field(default=1000, metadata={"help": "AR validation interval."})
-    answer_only_loss: bool = field(
-        default=False,
-        metadata={
-            "help": "Mask loss on non-assistant tokens. Requires a chat_template with generation tags."
-        },
-    )
-    cp_size: int = field(default=1, metadata={"help": "Context parallelism size."})
-    dp_shard_size: int | None = field(
-        default=None,
-        metadata={"help": "Data parallelism shard size. None = auto (total_gpu / cp_size)."},
-    )
-
-
-@dataclass
-class MedusaArguments:
-    medusa_num_heads: int | None = field(default=1)
-    medusa_num_layers: int | None = field(default=1)
+    estimate_ar: bool = False
+    ar_validate_steps: int = 1000
+    answer_only_loss: bool = False
+    cp_size: int = 1
+    dp_shard_size: int | None = None
 
 
 def _parse_cli() -> tuple[str, list[str]]:
@@ -162,19 +93,14 @@ def _parse_cli() -> tuple[str, list[str]]:
     return args.config, overrides
 
 
-def _load_config(config_path: str, overrides: list[str] = ()) -> tuple[dict, dict, dict]:
-    """Load a speculative-decoding recipe YAML into (hf_cfg, eagle_cfg, dflash_cfg).
+def _load_recipe(config_path: str, overrides: list[str] = ()):
+    """Load a speculative-decoding recipe YAML with OmegaConf dotlist merge + Pydantic validation.
 
     The YAML must be a modelopt recipe — ``metadata.recipe_type`` is ``speculative_eagle`` or
-    ``speculative_dflash`` — with ``model`` / ``data`` / ``training`` sections for HF Trainer
-    plus the algorithm-specific ``eagle`` or ``dflash`` section.
+    ``speculative_dflash`` — with ``model`` / ``data`` / ``training`` / ``medusa`` sections plus
+    the algorithm-specific ``eagle`` or ``dflash`` section.
 
     *overrides* are OmegaConf dotlist entries applied on top of the YAML.
-
-    Returns:
-        hf_cfg: Flat dict from model/data/training sections, for HfArgumentParser.parse_dict()
-        eagle_cfg: Eagle section dict (EagleConfig fields), passed directly to mtsp.convert()
-        dflash_cfg: DFlash section dict (DFlashConfig fields), passed directly to mtsp.convert()
     """
     merged = OmegaConf.load(config_path)
     if overrides:
@@ -182,44 +108,35 @@ def _load_config(config_path: str, overrides: list[str] = ()) -> tuple[dict, dic
     data = OmegaConf.to_container(merged, resolve=True)
 
     recipe = load_recipe_from_dict(data, source=config_path)
-
-    eagle_cfg: dict = {}
-    dflash_cfg: dict = {}
-    if isinstance(recipe, ModelOptEagleRecipe):
-        eagle_cfg = recipe.eagle.model_dump()
-    elif isinstance(recipe, ModelOptDFlashRecipe):
-        dflash_cfg = recipe.dflash.model_dump()
-    else:
+    if not isinstance(recipe, (ModelOptEagleRecipe, ModelOptDFlashRecipe)):
         raise ValueError(
             f"--config expected an EAGLE or DFlash recipe, got "
             f"{type(recipe).__name__} from {config_path}"
         )
-
-    hf_cfg = {**recipe.model, **recipe.data, **recipe.training}
-
-    if hf_cfg.get("dp_shard_size") is None:
-        cp_size = hf_cfg.get("cp_size", 1)
-        # Use WORLD_SIZE (total GPUs across all nodes) when available, else local GPU count.
-        world_size = int(os.environ.get("WORLD_SIZE", torch.cuda.device_count()))
-        hf_cfg["dp_shard_size"] = world_size // cp_size
-
-    return hf_cfg, eagle_cfg, dflash_cfg
+    return recipe
 
 
 def train():
     config_path, overrides = _parse_cli()
-    hf_cfg, eagle_cfg, dflash_cfg = _load_config(config_path, overrides)
+    recipe = _load_recipe(config_path, overrides)
 
-    parser = transformers.HfArgumentParser(
-        (
-            ModelArguments,
-            DataArguments,
-            TrainingArguments,
-            MedusaArguments,
-        )
-    )
-    model_args, data_args, training_args, medusa_args = parser.parse_dict(
-        hf_cfg, allow_extra_keys=True
+    # Pydantic-typed sections flow straight through as *_args; only TrainingArguments is
+    # reconstructed as an HF dataclass so it can be handed to transformers.Trainer.
+    model_args = recipe.model
+    data_args = recipe.data
+    medusa_args = recipe.medusa
+
+    training_dict = recipe.training.model_dump()
+    if training_dict.get("dp_shard_size") is None:
+        cp_size = training_dict.get("cp_size", 1)
+        # Use WORLD_SIZE (total GPUs across all nodes) when available, else local GPU count.
+        world_size = int(os.environ.get("WORLD_SIZE", torch.cuda.device_count()))
+        training_dict["dp_shard_size"] = world_size // cp_size
+    training_args = HfTrainingArguments(**training_dict)
+
+    eagle_cfg: dict = recipe.eagle.model_dump() if isinstance(recipe, ModelOptEagleRecipe) else {}
+    dflash_cfg: dict = (
+        recipe.dflash.model_dump() if isinstance(recipe, ModelOptDFlashRecipe) else {}
     )
 
     if not data_args.data_path and not data_args.offline_data_path:

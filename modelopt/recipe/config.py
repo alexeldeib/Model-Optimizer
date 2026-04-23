@@ -24,6 +24,12 @@ from pydantic import field_validator
 from modelopt.torch.opt.config import ModeloptBaseConfig, ModeloptField
 from modelopt.torch.quantization.config import QuantizeConfig
 from modelopt.torch.speculative.config import DFlashConfig, EagleConfig
+from modelopt.torch.speculative.plugins.hf_training_args import (
+    DataArguments,
+    MedusaArguments,
+    ModelArguments,
+    TrainingArguments,
+)
 
 
 class RecipeType(str, Enum):
@@ -82,24 +88,35 @@ class ModelOptSpeculativeRecipeBase(ModelOptRecipeBase):
 
     Unlike PTQ, speculative-decoding is a training-time optimization: the draft head is trained
     with HF Trainer. We therefore bundle ``model`` / ``data`` / ``training`` sections into the
-    recipe so a single YAML is the full experiment spec. The three sections are plain dicts
-    (not Pydantic models) because their schema is owned by the example script's HF dataclasses.
+    recipe so a single YAML is the full experiment spec. Each section is a typed Pydantic model
+    (see :mod:`modelopt.torch.speculative.plugins.hf_training_args`) so field typos and bad
+    values are caught at recipe-load time; HF trainer fields pass through
+    ``TrainingArguments`` via ``extra='allow'``.
     """
 
-    model: dict = ModeloptField(
-        default={},
+    model: ModelArguments = ModeloptField(
+        default=ModelArguments(),
         title="HF model args",
-        description="Dict merged into HfArgumentParser for ModelArguments.",
+        description="ModelArguments for the base HF model to train a draft head against.",
+        validate_default=True,
     )
-    data: dict = ModeloptField(
-        default={},
+    data: DataArguments = ModeloptField(
+        default=DataArguments(),
         title="HF data args",
-        description="Dict merged into HfArgumentParser for DataArguments.",
+        description="DataArguments for the training/offline dataset.",
+        validate_default=True,
     )
-    training: dict = ModeloptField(
-        default={},
+    training: TrainingArguments = ModeloptField(
+        default=TrainingArguments(),
         title="HF training args",
-        description="Dict merged into HfArgumentParser for TrainingArguments.",
+        description="Speculative-decoding extensions; HF trainer fields flow through as extras.",
+        validate_default=True,
+    )
+    medusa: MedusaArguments = ModeloptField(
+        default=MedusaArguments(),
+        title="Medusa args",
+        description="Medusa-specific arguments (used only when training.mode == 'medusa').",
+        validate_default=True,
     )
 
 

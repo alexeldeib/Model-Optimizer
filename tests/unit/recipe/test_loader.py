@@ -205,9 +205,9 @@ def test_load_recipe_eagle_builtin():
     assert isinstance(recipe, ModelOptEagleRecipe)
     assert recipe.eagle.eagle_decoder_type == "llama"
     assert recipe.eagle.eagle_ttt_steps == 3
-    # Full-pipeline recipe also carries HF trainer sections.
-    assert "mode" in recipe.training
-    assert recipe.training["mode"] == "eagle3"
+    # Full-pipeline recipe also carries typed HF trainer sections.
+    assert recipe.training.mode == "eagle3"
+    assert recipe.training.training_seq_len == 2048
 
 
 def test_load_recipe_eagle_dir(tmp_path):
@@ -256,9 +256,9 @@ def test_load_recipe_dflash_builtin():
     assert isinstance(recipe, ModelOptDFlashRecipe)
     assert recipe.dflash.dflash_block_size == 8
     assert recipe.dflash.dflash_num_anchors == 512
-    # Full-pipeline recipe also carries HF trainer sections.
-    assert "mode" in recipe.training
-    assert recipe.training["mode"] == "dflash"
+    # Full-pipeline recipe also carries typed HF trainer sections.
+    assert recipe.training.mode == "dflash"
+    assert recipe.training.training_seq_len == 4096
 
 
 def test_load_recipe_dflash_dir(tmp_path):
@@ -286,7 +286,7 @@ def test_load_recipe_dflash_missing_section_raises(tmp_path):
 
 
 def test_load_recipe_from_dict_eagle_with_training_sections():
-    """load_recipe_from_dict accepts a pre-merged dict and populates HF trainer sections."""
+    """load_recipe_from_dict accepts a pre-merged dict and populates typed HF trainer sections."""
     data = {
         "metadata": {"recipe_type": "speculative_eagle"},
         "model": {"model_name_or_path": "TinyLlama/TinyLlama-1.1B-Chat-v1.0"},
@@ -296,10 +296,54 @@ def test_load_recipe_from_dict_eagle_with_training_sections():
     }
     recipe = load_recipe_from_dict(data)
     assert isinstance(recipe, ModelOptEagleRecipe)
-    assert recipe.model["model_name_or_path"] == "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-    assert recipe.data["data_path"] == "train.jsonl"
-    assert recipe.training["output_dir"] == "ckpts/test"
+    assert recipe.model.model_name_or_path == "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    assert recipe.data.data_path == "train.jsonl"
+    # output_dir is an HF-trainer extra (not one of our 7 extension fields); flows through extras.
+    assert recipe.training.model_dump()["output_dir"] == "ckpts/test"
+    assert recipe.training.mode == "eagle3"
     assert recipe.eagle.eagle_ttt_steps == 2
+
+
+def test_typed_model_section_rejects_unknown_field():
+    """model section has extra='forbid'; unknown keys raise ValidationError at load time."""
+    data = {
+        "metadata": {"recipe_type": "speculative_eagle"},
+        "model": {"typo_name": "oops"},
+        "eagle": {"eagle_decoder_type": "llama"},
+    }
+    with pytest.raises(Exception):  # pydantic.ValidationError
+        load_recipe_from_dict(data)
+
+
+def test_typed_training_section_accepts_hf_extras():
+    """training section has extra='allow'; HF trainer fields flow through without validation."""
+    data = {
+        "metadata": {"recipe_type": "speculative_eagle"},
+        "training": {
+            "mode": "eagle3",
+            "num_train_epochs": 3,  # HF field — accepted as extra
+            "learning_rate": 1e-4,  # HF field — accepted as extra
+            "training_seq_len": 4096,  # our extension field — validated
+        },
+        "eagle": {"eagle_decoder_type": "llama"},
+    }
+    recipe = load_recipe_from_dict(data)
+    assert isinstance(recipe, ModelOptEagleRecipe)
+    assert recipe.training.training_seq_len == 4096
+    dumped = recipe.training.model_dump()
+    assert dumped["num_train_epochs"] == 3
+    assert dumped["learning_rate"] == 1e-4
+
+
+def test_typed_data_sample_size_validator():
+    """DataArguments rejects sample_size=0 via field_validator."""
+    data = {
+        "metadata": {"recipe_type": "speculative_eagle"},
+        "data": {"sample_size": 0},
+        "eagle": {"eagle_decoder_type": "llama"},
+    }
+    with pytest.raises(Exception, match="sample_size"):  # pydantic.ValidationError
+        load_recipe_from_dict(data)
 
 
 def test_load_recipe_dflash_field_validation_raises(tmp_path):
