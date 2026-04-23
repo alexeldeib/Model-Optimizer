@@ -23,12 +23,14 @@ from pydantic import field_validator
 
 from modelopt.torch.opt.config import ModeloptBaseConfig, ModeloptField
 from modelopt.torch.quantization.config import QuantizeConfig
+from modelopt.torch.speculative.config import EagleConfig
 
 
 class RecipeType(str, Enum):
     """List of recipe types."""
 
     PTQ = "ptq"
+    SPECULATIVE_EAGLE = "speculative_eagle"
     # QAT = "qat" # Not implemented yet, will be added in the future.
 
 
@@ -70,5 +72,16 @@ class ModelOptPTQRecipe(ModelOptRecipeBase):
         default=QuantizeConfig(),
         title="PTQ config",
         description="PTQ config containing quant_cfg and algorithm.",
+        validate_default=True,
+    )
+
+
+class ModelOptEagleRecipe(ModelOptRecipeBase):
+    """Our config class for EAGLE speculative decoding recipes."""
+
+    eagle: EagleConfig = ModeloptField(
+        default=EagleConfig(),
+        title="EAGLE config",
+        description="EAGLE speculative decoding configuration.",
         validate_default=True,
     )

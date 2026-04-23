@@ -49,6 +49,8 @@ from transformers.trainer_utils import get_last_checkpoint
 
 import modelopt.torch.opt as mto
 import modelopt.torch.speculative as mtsp
+from modelopt.recipe import load_recipe
+from modelopt.recipe.config import ModelOptEagleRecipe
 from modelopt.torch.speculative.config import EagleConfig
 from modelopt.torch.speculative.utils import load_vlm_or_llm, patch_transformers5_params_loading
 from modelopt.torch.utils import print_rank_0
@@ -144,23 +146,37 @@ class MedusaArguments:
     medusa_num_layers: int | None = field(default=1)
 
 
-def _parse_cli() -> tuple[str, list[str]]:
-    """Parse --config (required) from argv; return remaining args as config overrides.
+def _parse_cli() -> tuple[str, str | None, list[str]]:
+    """Parse --config (required) and --recipe (optional) from argv.
 
     Extra arguments use OmegaConf dotlist syntax, e.g.
     ``model.model_name_or_path=meta-llama/Llama-3.2-1B training.output_dir=ckpts/test``.
     """
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--config", required=True, help="Path to the YAML config file.")
+    p.add_argument(
+        "--recipe",
+        default=None,
+        help=(
+            "Optional modelopt recipe name or path for the EAGLE config. "
+            "When set, the 'eagle' section from --config is ignored and this recipe is used instead."
+        ),
+    )
     args, overrides = p.parse_known_args()
-    return args.config, overrides
+    return args.config, args.recipe, overrides
 
 
-def _load_config(config_path: str, overrides: list[str] = ()) -> tuple[dict, dict, dict]:
+def _load_config(
+    config_path: str, recipe_path: str | None = None, overrides: list[str] = ()
+) -> tuple[dict, dict, dict]:
     """Load training config from a YAML file with sections: model, data, training, eagle/dflash.
 
     *overrides* are OmegaConf dotlist entries (e.g. ``["model.model_name_or_path=xxx"]``)
     applied on top of the YAML.
+
+    When *recipe_path* is provided, the eagle section is sourced from the recipe instead of
+    from the YAML file — the recipe goes through ``modelopt.recipe.load_recipe`` and yields a
+    ``ModelOptEagleRecipe``.
 
     Returns:
         hf_cfg: Flat dict from model/data/training sections, for HfArgumentParser.parse_dict()
@@ -172,8 +188,15 @@ def _load_config(config_path: str, overrides: list[str] = ()) -> tuple[dict, dic
         merged = OmegaConf.merge(merged, OmegaConf.from_dotlist(list(overrides)))
     cfg = OmegaConf.to_container(merged, resolve=True)
 
-    # Eagle/DFlash sections map directly to config fields — no field enumeration needed.
-    eagle_cfg = cfg.get("eagle", {})
+    if recipe_path is not None:
+        recipe = load_recipe(recipe_path)
+        if not isinstance(recipe, ModelOptEagleRecipe):
+            raise ValueError(
+                f"--recipe expected an EAGLE recipe, got {type(recipe).__name__} from {recipe_path}"
+            )
+        eagle_cfg = recipe.eagle.model_dump()
+    else:
+        eagle_cfg = cfg.get("eagle", {})
     dflash_cfg = cfg.get("dflash", {})
 
     hf_cfg = {
@@ -192,8 +215,8 @@ def _load_config(config_path: str, overrides: list[str] = ()) -> tuple[dict, dic
 
 
 def train():
-    config_path, overrides = _parse_cli()
-    hf_cfg, eagle_cfg, dflash_cfg = _load_config(config_path, overrides)
+    config_path, recipe_path, overrides = _parse_cli()
+    hf_cfg, eagle_cfg, dflash_cfg = _load_config(config_path, recipe_path, overrides)
 
     parser = transformers.HfArgumentParser(
         (

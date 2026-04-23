@@ -19,7 +19,7 @@ import re
 
 import pytest
 
-from modelopt.recipe.config import ModelOptPTQRecipe, RecipeType
+from modelopt.recipe.config import ModelOptEagleRecipe, ModelOptPTQRecipe, RecipeType
 from modelopt.recipe.loader import load_config, load_recipe
 
 # ---------------------------------------------------------------------------
@@ -186,6 +186,54 @@ def test_load_recipe_dir_missing_quantize_raises(tmp_path):
     (tmp_path / "recipe.yml").write_text("metadata:\n  recipe_type: ptq\n")
     with pytest.raises(ValueError, match="quantize"):
         load_recipe(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# load_recipe — EAGLE speculative decoding
+# ---------------------------------------------------------------------------
+
+
+def test_load_recipe_eagle_builtin():
+    """load_recipe loads the built-in EAGLE recipe and returns a ModelOptEagleRecipe."""
+    recipe = load_recipe("general/speculative_decoding/eagle3_recipe")
+    assert recipe.recipe_type == RecipeType.SPECULATIVE_EAGLE
+    assert isinstance(recipe, ModelOptEagleRecipe)
+    assert recipe.eagle.eagle_decoder_type == "llama"
+    assert recipe.eagle.eagle_ttt_steps == 3
+
+
+def test_load_recipe_eagle_dir(tmp_path):
+    """load_recipe loads an EAGLE recipe from a directory with recipe.yml + eagle.yml."""
+    (tmp_path / "recipe.yml").write_text(
+        "metadata:\n  recipe_type: speculative_eagle\n  description: Dir eagle test.\n"
+    )
+    (tmp_path / "eagle.yml").write_text(
+        "eagle_decoder_type: llama\neagle_ttt_steps: 5\neagle_use_torch_compile: false\n"
+    )
+    recipe = load_recipe(tmp_path)
+    assert recipe.recipe_type == RecipeType.SPECULATIVE_EAGLE
+    assert isinstance(recipe, ModelOptEagleRecipe)
+    assert recipe.description == "Dir eagle test."
+    assert recipe.eagle.eagle_ttt_steps == 5
+    assert recipe.eagle.eagle_use_torch_compile is False
+
+
+def test_load_recipe_eagle_missing_section_raises(tmp_path):
+    """load_recipe raises ValueError when 'eagle' is absent for a SPECULATIVE_EAGLE recipe."""
+    bad = tmp_path / "bad.yml"
+    bad.write_text("metadata:\n  recipe_type: speculative_eagle\n")
+    with pytest.raises(ValueError, match="eagle"):
+        load_recipe(bad)
+
+
+def test_load_recipe_eagle_field_validation_raises(tmp_path):
+    """Invalid EAGLE field values must fail Pydantic validation at load time."""
+    bad = tmp_path / "bad.yml"
+    bad.write_text(
+        "metadata:\n  recipe_type: speculative_eagle\neagle:\n  eagle_ttt_steps: not_an_int\n"
+    )
+    with pytest.raises(Exception):  # pydantic.ValidationError
+        load_recipe(bad)
 
 
 # ---------------------------------------------------------------------------

@@ -22,7 +22,7 @@ except ImportError:  # Python < 3.11
 from pathlib import Path
 
 from ._config_loader import BUILTIN_RECIPES_LIB, load_config
-from .config import ModelOptPTQRecipe, ModelOptRecipeBase, RecipeType
+from .config import ModelOptEagleRecipe, ModelOptPTQRecipe, ModelOptRecipeBase, RecipeType
 
 __all__ = ["load_config", "load_recipe"]
 
@@ -54,9 +54,11 @@ def load_recipe(recipe_path: str | Path | Traversable) -> ModelOptRecipeBase:
 
     ``recipe_path`` can be:
 
-    * A ``.yml`` / ``.yaml`` file with ``metadata`` and ``quantize`` sections.
-      The suffix may be omitted and will be probed automatically.
-    * A directory containing ``recipe.yml`` (metadata) and ``quantize.yml``.
+    * A ``.yml`` / ``.yaml`` file with ``metadata`` and one of ``quantize`` (PTQ)
+      or ``eagle`` (EAGLE speculative decoding) sections. The suffix may be
+      omitted and will be probed automatically.
+    * A directory containing ``recipe.yml`` (metadata) plus ``quantize.yml`` or
+      ``eagle.yml`` depending on ``recipe_type``.
 
     The path may be relative to the built-in recipes library or an absolute /
     relative filesystem path.
@@ -101,6 +103,14 @@ def _load_recipe_from_file(recipe_file: Path | Traversable) -> ModelOptRecipeBas
             description=metadata.get("description", "PTQ recipe."),
             quantize=data["quantize"],
         )
+    if recipe_type == RecipeType.SPECULATIVE_EAGLE:
+        if "eagle" not in data:
+            raise ValueError(f"EAGLE recipe file {recipe_file} must contain 'eagle'.")
+        return ModelOptEagleRecipe(
+            recipe_type=RecipeType.SPECULATIVE_EAGLE,
+            description=metadata.get("description", "EAGLE speculative decoding recipe."),
+            eagle=data["eagle"],
+        )
     raise ValueError(f"Unsupported recipe type: {recipe_type!r}")
 
 
@@ -137,5 +147,21 @@ def _load_recipe_from_dir(recipe_dir: Path | Traversable) -> ModelOptRecipeBase:
             recipe_type=RecipeType.PTQ,
             description=metadata.get("description", "PTQ recipe."),
             quantize=load_config(quantize_file),
+        )
+    if recipe_type == RecipeType.SPECULATIVE_EAGLE:
+        eagle_file = None
+        for name in ("eagle.yml", "eagle.yaml"):
+            candidate = recipe_dir.joinpath(name)
+            if candidate.is_file():
+                eagle_file = candidate
+                break
+        if eagle_file is None:
+            raise ValueError(
+                f"Cannot find eagle in {recipe_dir}. Looked for: eagle.yml, eagle.yaml"
+            )
+        return ModelOptEagleRecipe(
+            recipe_type=RecipeType.SPECULATIVE_EAGLE,
+            description=metadata.get("description", "EAGLE speculative decoding recipe."),
+            eagle=load_config(eagle_file),
         )
     raise ValueError(f"Unsupported recipe type: {recipe_type!r}")
