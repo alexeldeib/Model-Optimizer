@@ -93,10 +93,7 @@ def load_recipe(
     print(f"[load_recipe] loading: {_display}")
 
     if resolved.is_file():
-        data = load_config(resolved)
-        if overrides:
-            data = _apply_dotlist(data, overrides)
-        return _load_recipe_from_dict(data, source=str(resolved))
+        return _load_recipe_from_file(resolved, overrides=overrides)
 
     if resolved.is_dir():
         if overrides:
@@ -127,17 +124,27 @@ def _apply_dotlist(data: dict, overrides: list[str]) -> dict:
     return OmegaConf.to_container(merged, resolve=True)
 
 
-def _load_recipe_from_dict(data: dict, source: str | None = None) -> ModelOptRecipeBase:
-    """(private) Dispatch a recipe dict to the right Pydantic class via ``metadata.recipe_type``."""
+def _load_recipe_from_file(
+    recipe_file: Path | Traversable,
+    overrides: list[str] | None = None,
+) -> ModelOptRecipeBase:
+    """Load a recipe from a YAML file, optionally applying dotlist overrides.
+
+    The file must contain a ``metadata`` section with at least ``recipe_type``,
+    plus the algorithm-specific section (``quantize`` / ``eagle`` / ``dflash`` / ``medusa``).
+    """
+    data = load_config(recipe_file)
+    if overrides:
+        data = _apply_dotlist(data, overrides)
+
     metadata = data.get("metadata", {})
     recipe_type = metadata.get("recipe_type")
-    source_str = f"{source!s} " if source is not None else ""
     if recipe_type is None:
-        raise ValueError(f"Recipe {source_str}must contain a 'metadata.recipe_type' field.")
+        raise ValueError(f"Recipe file {recipe_file} must contain a 'metadata.recipe_type' field.")
 
     if recipe_type == RecipeType.PTQ:
         if "quantize" not in data:
-            raise ValueError(f"PTQ recipe {source_str}must contain 'quantize'.")
+            raise ValueError(f"PTQ recipe file {recipe_file} must contain 'quantize'.")
         return ModelOptPTQRecipe(
             recipe_type=RecipeType.PTQ,
             description=metadata.get("description", "PTQ recipe."),
@@ -145,7 +152,7 @@ def _load_recipe_from_dict(data: dict, source: str | None = None) -> ModelOptRec
         )
     if recipe_type == RecipeType.SPECULATIVE_EAGLE:
         if "eagle" not in data:
-            raise ValueError(f"EAGLE recipe {source_str}must contain 'eagle'.")
+            raise ValueError(f"EAGLE recipe file {recipe_file} must contain 'eagle'.")
         return ModelOptEagleRecipe(
             recipe_type=RecipeType.SPECULATIVE_EAGLE,
             description=metadata.get("description", "EAGLE speculative decoding recipe."),
@@ -156,7 +163,7 @@ def _load_recipe_from_dict(data: dict, source: str | None = None) -> ModelOptRec
         )
     if recipe_type == RecipeType.SPECULATIVE_DFLASH:
         if "dflash" not in data:
-            raise ValueError(f"DFlash recipe {source_str}must contain 'dflash'.")
+            raise ValueError(f"DFlash recipe file {recipe_file} must contain 'dflash'.")
         return ModelOptDFlashRecipe(
             recipe_type=RecipeType.SPECULATIVE_DFLASH,
             description=metadata.get("description", "DFlash speculative decoding recipe."),
@@ -167,7 +174,7 @@ def _load_recipe_from_dict(data: dict, source: str | None = None) -> ModelOptRec
         )
     if recipe_type == RecipeType.SPECULATIVE_MEDUSA:
         if "medusa" not in data:
-            raise ValueError(f"Medusa recipe {source_str}must contain 'medusa'.")
+            raise ValueError(f"Medusa recipe file {recipe_file} must contain 'medusa'.")
         return ModelOptMedusaRecipe(
             recipe_type=RecipeType.SPECULATIVE_MEDUSA,
             description=metadata.get("description", "Medusa speculative decoding recipe."),

@@ -25,7 +25,7 @@ from modelopt.recipe.config import (
     ModelOptPTQRecipe,
     RecipeType,
 )
-from modelopt.recipe.loader import _apply_dotlist, _load_recipe_from_dict, load_config, load_recipe
+from modelopt.recipe.loader import _apply_dotlist, load_config, load_recipe
 
 # ---------------------------------------------------------------------------
 # Static YAML fixtures
@@ -253,16 +253,17 @@ def test_load_recipe_dflash_missing_section_raises(tmp_path):
         load_recipe(bad)
 
 
-def test_load_recipe_from_dict_eagle_with_training_sections():
-    """_load_recipe_from_dict accepts a pre-merged dict and populates typed HF trainer sections."""
-    data = {
-        "metadata": {"recipe_type": "speculative_eagle"},
-        "model": {"model_name_or_path": "TinyLlama/TinyLlama-1.1B-Chat-v1.0"},
-        "data": {"data_path": "train.jsonl"},
-        "training": {"mode": "eagle3", "output_dir": "ckpts/test"},
-        "eagle": {"eagle_decoder_type": "llama", "eagle_ttt_steps": 2},
-    }
-    recipe = _load_recipe_from_dict(data)
+def test_load_recipe_eagle_with_training_sections(tmp_path):
+    """load_recipe populates typed HF trainer sections from all four YAML segments."""
+    recipe_path = tmp_path / "eagle.yml"
+    recipe_path.write_text(
+        "metadata:\n  recipe_type: speculative_eagle\n"
+        "model:\n  model_name_or_path: TinyLlama/TinyLlama-1.1B-Chat-v1.0\n"
+        "data:\n  data_path: train.jsonl\n"
+        "training:\n  mode: eagle3\n  output_dir: ckpts/test\n"
+        "eagle:\n  eagle_decoder_type: llama\n  eagle_ttt_steps: 2\n"
+    )
+    recipe = load_recipe(recipe_path)
     assert isinstance(recipe, ModelOptEagleRecipe)
     assert recipe.model.model_name_or_path == "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     assert recipe.data.data_path == "train.jsonl"
@@ -272,30 +273,31 @@ def test_load_recipe_from_dict_eagle_with_training_sections():
     assert recipe.eagle.eagle_ttt_steps == 2
 
 
-def test_typed_model_section_rejects_unknown_field():
+def test_typed_model_section_rejects_unknown_field(tmp_path):
     """model section has extra='forbid'; unknown keys raise ValidationError at load time."""
-    data = {
-        "metadata": {"recipe_type": "speculative_eagle"},
-        "model": {"typo_name": "oops"},
-        "eagle": {"eagle_decoder_type": "llama"},
-    }
+    recipe_path = tmp_path / "bad.yml"
+    recipe_path.write_text(
+        "metadata:\n  recipe_type: speculative_eagle\n"
+        "model:\n  typo_name: oops\n"
+        "eagle:\n  eagle_decoder_type: llama\n"
+    )
     with pytest.raises(Exception):  # pydantic.ValidationError
-        _load_recipe_from_dict(data)
+        load_recipe(recipe_path)
 
 
-def test_typed_training_section_accepts_hf_extras():
+def test_typed_training_section_accepts_hf_extras(tmp_path):
     """training section has extra='allow'; HF trainer fields flow through without validation."""
-    data = {
-        "metadata": {"recipe_type": "speculative_eagle"},
-        "training": {
-            "mode": "eagle3",
-            "num_train_epochs": 3,  # HF field — accepted as extra
-            "learning_rate": 1e-4,  # HF field — accepted as extra
-            "training_seq_len": 4096,  # our extension field — validated
-        },
-        "eagle": {"eagle_decoder_type": "llama"},
-    }
-    recipe = _load_recipe_from_dict(data)
+    recipe_path = tmp_path / "eagle.yml"
+    recipe_path.write_text(
+        "metadata:\n  recipe_type: speculative_eagle\n"
+        "training:\n"
+        "  mode: eagle3\n"
+        "  num_train_epochs: 3\n"  # HF field — accepted as extra
+        "  learning_rate: 1.0e-4\n"  # HF field — accepted as extra
+        "  training_seq_len: 4096\n"  # our extension field — validated
+        "eagle:\n  eagle_decoder_type: llama\n"
+    )
+    recipe = load_recipe(recipe_path)
     assert isinstance(recipe, ModelOptEagleRecipe)
     assert recipe.training.training_seq_len == 4096
     dumped = recipe.training.model_dump()
@@ -390,15 +392,16 @@ def test_load_recipe_overrides_rejected_for_dir(tmp_path):
         load_recipe(tmp_path, overrides=["quantize.algorithm=gptq"])
 
 
-def test_typed_data_sample_size_validator():
+def test_typed_data_sample_size_validator(tmp_path):
     """DataArguments rejects sample_size=0 via field_validator."""
-    data = {
-        "metadata": {"recipe_type": "speculative_eagle"},
-        "data": {"sample_size": 0},
-        "eagle": {"eagle_decoder_type": "llama"},
-    }
+    recipe_path = tmp_path / "bad.yml"
+    recipe_path.write_text(
+        "metadata:\n  recipe_type: speculative_eagle\n"
+        "data:\n  sample_size: 0\n"
+        "eagle:\n  eagle_decoder_type: llama\n"
+    )
     with pytest.raises(Exception, match="sample_size"):  # pydantic.ValidationError
-        _load_recipe_from_dict(data)
+        load_recipe(recipe_path)
 
 
 def test_load_recipe_dflash_field_validation_raises(tmp_path):
