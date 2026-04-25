@@ -29,6 +29,7 @@ import torch
 import torch.nn as nn
 from accelerate import Accelerator
 from example_utils import build_quant_cfg, get_tokenizer
+from modelopt.recipe import ModelOptPTQRecipe, load_recipe
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, PreTrainedTokenizer, PreTrainedTokenizerFast
 
@@ -38,7 +39,8 @@ from modelopt.torch.export import get_model_type
 from modelopt.torch.export.convert_hf_config import convert_hf_quant_config_format
 from modelopt.torch.export.unified_export_hf import _export_transformers_checkpoint
 from modelopt.torch.quantization.config import need_calibration
-from modelopt.torch.quantization.utils import patch_fsdp_mp_dtypes
+from modelopt.torch.quantization.plugins.huggingface import patch_compressed_linear_loading
+from modelopt.torch.quantization.utils import no_requires_grad, patch_fsdp_mp_dtypes
 from modelopt.torch.utils.dataset_utils import get_dataset_dataloader, get_supported_datasets
 
 # Constants
@@ -82,6 +84,14 @@ def parse_args():
         default="fp8",
         choices=QUANT_CFG_CHOICES.keys(),
         help="Quantization format",
+    )
+    parser.add_argument(
+        "--recipe",
+        default=None,
+        help=(
+            "PTQ recipe YAML file or recipe name. When set, this is used instead of --qformat "
+            "for the main quantization config."
+        ),
     )
     parser.add_argument(
         "--kv_cache_qformat",
@@ -148,10 +158,12 @@ def load_and_prepare_model(
     Returns:
         Tuple of (prepared_model, model_type, original_architectures, calibration_dataloader)
     """
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path, dtype="auto", trust_remote_code=trust_remote_code
-    )
+    with patch_compressed_linear_loading():
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path, dtype="auto", trust_remote_code=trust_remote_code
+        )
     model.eval()
+    model.requires_grad_(False)
     model_type = get_model_type(model)
     # Need the original architectures for export
     # FSDP prefix is added to the architectures for FSDP2 wrapped models
@@ -159,7 +171,14 @@ def load_and_prepare_model(
 
     # FSDP2 requires an optimizer to be prepared together with the model
     dummy_optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
-    model, _, calibration_dataloader = accelerator.prepare(model, dummy_optimizer, calib_dataloader)
+    if accelerator.is_main_process:
+        print("Preparing model with FSDP2...")
+    with no_requires_grad():
+        model, _, calibration_dataloader = accelerator.prepare(
+            model, dummy_optimizer, calib_dataloader
+        )
+    if accelerator.is_main_process:
+        print("FSDP2 prepare completed.")
 
     return model, model_type, original_architectures, calibration_dataloader
 
@@ -327,16 +346,26 @@ def main(args):
         trust_remote_code=args.trust_remote_code,
     )
 
-    quant_cfg = QUANT_CFG_CHOICES[args.qformat]
+    if args.recipe is not None:
+        recipe = load_recipe(args.recipe)
+        assert isinstance(recipe, ModelOptPTQRecipe), (
+            f"Expected PTQ recipe, but got {type(recipe).__name__} from {args.recipe}"
+        )
+        quant_cfg = recipe.quantize.model_dump()
+        enable_quant_kv_cache = False
+        if args.kv_cache_qformat != "none" and accelerator.is_main_process:
+            warnings.warn("--kv_cache_qformat is ignored when --recipe is used.")
+    else:
+        quant_cfg = QUANT_CFG_CHOICES[args.qformat]
 
-    quant_cfg = build_quant_cfg(
-        args.qformat,
-        quant_cfg,
-        args.awq_block_size,
-        model_type,
-    )
+        quant_cfg = build_quant_cfg(
+            args.qformat,
+            quant_cfg,
+            args.awq_block_size,
+            model_type,
+        )
+        enable_quant_kv_cache = args.kv_cache_qformat != "none"
 
-    enable_quant_kv_cache = args.kv_cache_qformat != "none"
     print(f"{'Enable' if enable_quant_kv_cache else 'Disable'} KV cache quantization")
 
     # Check if any bmm_quantizer is in the quant_cfg. If so, we need to enable the bmm_quantizer.

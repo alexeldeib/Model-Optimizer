@@ -615,9 +615,8 @@ def get_model(
             with patch_compressed_linear_loading():
                 model = AutoModelForCausalLM.from_pretrained(
                     ckpt_path,
-                    device_map="auto",
-                    trust_remote_code=trust_remote_code,
-                    dtype="auto",
+                    device_map=device_map,
+                    **model_kwargs,
                 )
         else:
             architecture = hf_config.architectures[0]

@@ -83,6 +83,7 @@ def convert_to_eagle3_speculator_config(
     verifier_config_path = os.path.join(verifier_name_or_path, "config.json")
     with open(verifier_config_path, encoding="utf-8") as verifier_cfg_file:
         verifier_cfg = json.load(verifier_cfg_file)
+    verifier_text_cfg = verifier_cfg.get("text_config") or verifier_cfg
 
     speculator_config = deepcopy(template_cfg)
 
@@ -91,7 +92,9 @@ def convert_to_eagle3_speculator_config(
         speculator_config["speculators_config"].update(
             {
                 "verifier": {
-                    "architectures": verifier_cfg["architectures"],
+                    "architectures": verifier_cfg.get(
+                        "architectures", verifier_text_cfg.get("architectures", [])
+                    ),
                     "name_or_path": verifier_name_or_path,
                 },
             }
@@ -101,7 +104,7 @@ def convert_to_eagle3_speculator_config(
         speculator_config.update(
             {
                 "draft_vocab_size": draft_cfg["draft_vocab_size"],
-                "target_hidden_size": verifier_cfg["hidden_size"],
+                "target_hidden_size": verifier_text_cfg["hidden_size"],
                 "torch_dtype": draft_cfg["torch_dtype"],
                 "transformer_layer_config": {
                     k: draft_cfg[k] for k in template_cfg["transformer_layer_config"]
