@@ -78,12 +78,17 @@ spec:
                   fieldPath: metadata.name
             - name: NUM_GPUS
               value: "8"
-            # Smoke-test target.  Override to mistralai/Mixtral-8x7B-v0.1
-            # or Qwen/Qwen3-MoE-30B-A3B by patching this env var.
+            # Smoke-test target.  Qwen2.5-7B-Instruct has built-in
+            # transformers 5.x support (no trust_remote_code), so it
+            # validates the layerwise+FSDP2+GPTQ plumbing without
+            # tripping on remote-code modeling files that pin older
+            # transformers internals.  Switch to mistralai/Mixtral-8x7B
+            # or Qwen/Qwen2-MoE for MoE-specific validation once the
+            # dense path is green.
             - name: TARGET_MODEL
-              value: deepseek-ai/DeepSeek-V2-Lite
+              value: Qwen/Qwen2.5-7B-Instruct
             - name: RECIPE
-              value: /opt/quanty/modelopt_recipes/general/ptq/nvfp4_experts_only-fp8_kv.yaml
+              value: /opt/quanty/modelopt_recipes/general/ptq/nvfp4_default-none_kv_gptq.yaml
             - name: RUN_DIR
               value: /work/quanty/runs/discovery-$(POD_NAME)
           resources:

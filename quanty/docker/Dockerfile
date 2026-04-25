@@ -62,6 +62,7 @@ RUN PIP_CONSTRAINT= pip install --upgrade pip wheel setuptools \
         "datasets>=3.0.0,<4" \
         "torchvision" \
  && PIP_CONSTRAINT= pip install \
+        "compressed_tensors>=0.13.0" \
         "hf_transfer>=0.1.6" \
         "numpy<2.0" \
         "pyyaml>=6.0" \
