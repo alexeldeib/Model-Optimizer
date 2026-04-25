@@ -94,6 +94,13 @@ SIGNALS = [
     ("gptq_hessian",          r"GPTQHelper|computing Hessian"),
     ("expert_routing",        r"expert.*not.*calibrated|amax is None"),
     ("hf_download_fail",      r"Cannot resolve|repository not found|gated repo|401 Client Error"),
+    # Attention/cache replay bug surfaced by GPTQ layerwise on transformers 5.x:
+    # mask k_len mismatches actual KV k_len because DynamicCache state leaks
+    # across captured-input replays.  ``cache.reset()`` in model_calib.py only
+    # covers kwargs_input["past_key_values"]; layer-internal cache mutation
+    # across replays is not reset.
+    ("attn_cache_shape",      r"scaled_dot_product_attention.*\n.*expanded size of the tensor|sdpa_attention_forward.*RuntimeError"),
+    ("transformers_5_compat", r"is_torch_fx_available|cannot import name '\w+' from 'transformers"),
 ]
 hits = {name: bool(re.search(pat, log)) for name, pat in SIGNALS}
 

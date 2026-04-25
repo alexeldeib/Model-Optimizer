@@ -77,6 +77,38 @@ before assignment.  Fix shipped at `quanty/scripts/patch-k26-modeling.sh`
 - Team uses INT4 source + extensive dequant-on-load patches; this path
   uses BF16 source to keep the upstream-bound fixes clean.
 
+## Phase 0 discovery findings (2026-04-25)
+
+Iter 1-3 exposed three image / launcher gaps (all fixed):
+- `multinode_ptq.py` does not accept `--calib_seq` / `--layerwise_checkpoint_dir`
+- `compressed_tensors` was missing from the depot image
+- `deepseek-ai/DeepSeek-V2-Lite` is not viable with transformers 5.x (its
+  `modeling_deepseek.py` imports `is_torch_fx_available`, removed upstream)
+
+Iter 4 reached **GPTQ Hessian collection on Qwen2.5-7B-Instruct** under
+FSDP2 + layerwise, then crashed in transformers' `sdpa_attention_forward`:
+
+    RuntimeError: The expanded size of the tensor (1024) must match the
+    existing size (512) at non-singleton dimension 3.
+    Target sizes: [4, 28, 512, 1024].  Tensor sizes: [4, 1, 512, 512]
+
+This is a **transformers 5.x ``DynamicCache`` × layerwise GPTQ × replayed
+forward** bug that lives below our upstream commits' scope: the captured
+``kwargs_input`` for a layer carries an attention mask sized for the
+first forward (k_len=512), but the cache mutates in place across replays,
+so the second replay sees k_len=1024 KV with a 512-wide mask.  The reset
+in `model_calib.py:1657-1666` only handles ``kwargs_input["past_key_values"]``,
+not the in-place state mutation that transformers 5.x's `DynamicCache`
+performs across a layer's forward.
+
+Logged as a Phase 1 follow-up; **not in our upstream PR scope**.  Both
+upstream commits (VLM decoder discovery + distributed checkpoint)
+executed cleanly past their contracts.
+
+K2.6 uses MLA attention, not standard SDPA; the bug should not reproduce
+on the GB200 K2.6 path.  Validate that hypothesis there before
+committing engineering time to a Phase 1 fix.
+
 ## Ground rules
 
 - Do not skip the small-MoE smoke tests before K2.6.  Cluster hours saved
