@@ -1,0 +1,35 @@
+{
+  "$schema": "https://depot.dev/schema/depot.json",
+  "version": 1,
+  "build": {
+    "context": "../..",
+    "dockerfile": "quanty/docker/Dockerfile",
+    "platforms": ["linux/amd64"],
+    "tags": [
+      "docker.cloudsmith.io/coreweave/infr-dev/quanty-modelopt:dev"
+    ],
+    "cache": {
+      "from": [
+        {
+          "type": "registry",
+          "ref": "docker.cloudsmith.io/coreweave/infr-dev/quanty-modelopt:cache"
+        }
+      ],
+      "to": [
+        {
+          "type": "registry",
+          "ref": "docker.cloudsmith.io/coreweave/infr-dev/quanty-modelopt:cache",
+          "mode": "max"
+        }
+      ]
+    },
+    "args": {
+      "FLASHINFER_WHEEL": "flashinfer-python==0.6.0"
+    }
+  },
+  "_TODO": [
+    "Set DEPOT_PROJECT_ID in env or via 'depot build --project <id>'.",
+    "Replace placeholder cloudsmith ref if infra-dev path changes.",
+    "For SM120-patched FlashInfer, override FLASHINFER_WHEEL via --build-arg."
+  ]
+}

@@ -1,0 +1,111 @@
+# K2.6-aware NVFP4 experts-only + FP8 KV recipe.
+#
+# Architecture facts that drive the selectors:
+#   * K2.6 = KimiK25ForConditionalGeneration wrapping DeepseekV3ForCausalLM
+#     (text backbone) + MoonViT (vision encoder).
+#   * 61 layers, hidden 7168, 384 routed experts + 1 shared, top_k=8.
+#   * MLA attention: q_lora_rank=1536, kv_lora_rank=512.  Up-proj is sensitive
+#     to quantization (recovers low-rank latent into full QKV); keep it BF16.
+#   * first_k_dense_replace=1 -> layer 0 is dense MLP, layers 1-60 use MoE.
+#
+# Why this differs from the upstream nvfp4_experts_only-fp8_kv recipe:
+#   * Adds DeepSeek-style MoE expert path selectors
+#     (`*mlp.experts.*`, `*shared_experts.*`).
+#   * Explicitly skips the shared expert (always-active; quant noise compounds).
+#   * Skips MLA up-proj quantizers (`*kv_a_proj_with_mqa*`, `*kv_b_proj*`,
+#     `*q_a_proj*`, `*q_b_proj*`) -- low-rank to full QKV is precision-sensitive.
+#   * Skips the entire MoonViT vision encoder (`*vision*`, `*vit*`) -- visual
+#     features mismatched against the LLM token stream when quantized.
+#   * Skips the gate/router (`*mlp.gate*`) -- routing decisions need precision.
+#   * GPTQ + layerwise calibration with checkpoint resume.
+#
+# Inherits the layerwise=true mechanism from
+# modelopt/torch/quantization/utils/layerwise_calib.py via the
+# `algorithm.layerwise: true` toggle.
+metadata:
+  recipe_type: ptq
+  description: >
+    Kimi K2.6 NVFP4 experts-only (W4A4) + FP8 KV; MLA up-proj kept BF16,
+    shared expert kept BF16, MoonViT kept BF16; GPTQ layerwise calibration
+    with shared-FS checkpoint resume.
+
+quantize:
+  algorithm:
+    method: gptq
+    layerwise: true
+    layerwise_checkpoint_dir: /work/quanty/checkpoints/k26-nvfp4-experts-only
+  quant_cfg:
+    # 1) Disable everything by default.  Selectors below opt-in.
+    - quantizer_name: '*'
+      enable: false
+
+    # 2) NVFP4 W4A4 on routed expert weights (DeepseekV3-style path).
+    - quantizer_name: '*mlp.experts.*weight_quantizer'
+      enable: true
+      cfg:
+        block_sizes:
+          -1: 16
+          type: static
+          scale_bits: e4m3
+        num_bits: e2m1
+    - quantizer_name: '*mlp.experts.*input_quantizer'
+      enable: true
+      cfg:
+        block_sizes:
+          -1: 16
+          type: dynamic
+          scale_bits: e4m3
+        num_bits: e2m1
+
+    # 3) FP8 KV cache (matches NVIDIA's published Kimi-K2.5-NVFP4).
+    - quantizer_name: '*[kv]_bmm_quantizer'
+      enable: true
+      cfg:
+        num_bits: e4m3
+
+    # 4) Explicit skips for precision-sensitive paths.
+    #    Shared expert: always-active, quant noise compounds.
+    - quantizer_name: '*mlp.shared_experts.*'
+      enable: false
+    - quantizer_name: '*mlp.shared_expert_gate*'
+      enable: false
+    #    MoE router / gate: routing decisions must stay precise.
+    - quantizer_name: '*mlp.gate*'
+      enable: false
+    - quantizer_name: '*router*'
+      enable: false
+    #    MLA: q_lora / kv_lora down-up projections.  Up-proj recovers full
+    #    QKV from a low-rank latent; quant errors compound across heads.
+    - quantizer_name: '*q_a_proj*'
+      enable: false
+    - quantizer_name: '*q_b_proj*'
+      enable: false
+    - quantizer_name: '*kv_a_proj_with_mqa*'
+      enable: false
+    - quantizer_name: '*kv_b_proj*'
+      enable: false
+    #    MoonViT vision tower -- entire path stays BF16.
+    - quantizer_name: '*vision*'
+      enable: false
+    - quantizer_name: '*vit*'
+      enable: false
+    - quantizer_name: '*moon_vit*'
+      enable: false
+    #    Embedding / output head.
+    - quantizer_name: '*lm_head*'
+      enable: false
+    - quantizer_name: '*output_layer*'
+      enable: false
+    - quantizer_name: 'output.*'
+      enable: false
+
+    # 5) Norms / nonlinearities never quantized.
+    - parent_class: 'nn.LayerNorm'
+      quantizer_name: '*'
+      enable: false
+    - parent_class: 'nn.RMSNorm'
+      quantizer_name: '*'
+      enable: false
+    - parent_class: 'nn.SiLU'
+      quantizer_name: '*'
+      enable: false

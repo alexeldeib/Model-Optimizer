@@ -1,0 +1,106 @@
+---
+# Phase 0: FSDP2 layerwise discovery run on a small MoE.
+# Goal: surface the specific failure modes that block layerwise calibration
+# in multinode_ptq.py under FSDP2.  Output is a structured report on the
+# k26-nvfp4-ckpt PVC under /work/quanty/runs/<run-id>/discovery.json.
+#
+# Hardware: 8x RTX Pro 6000 (SM120) on a single node.  This is INTENTIONALLY
+# not GB200 -- we want fast iteration on FSDP2 plumbing, not on NVFP4 MoE
+# kernels.  The discovery script targets dense NVFP4 + FP8 KV; it explicitly
+# avoids the SM120 grouped-block-scaled FP4 MoE GEMM bug (FlashInfer #2723 /
+# CUTLASS #3096).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: quanty-rtxpro6000-discovery
+  namespace: ace-inference
+  labels:
+    app: quanty-rtxpro6000-discovery
+    workstream: phase0-discovery
+    owner: aeldeib
+spec:
+  backoffLimit: 0  # don't auto-retry; we want to see the first failure
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: quanty-rtxpro6000-discovery
+        owner: aeldeib
+    spec:
+      restartPolicy: Never
+      schedulerName: binpack-scheduler
+      priorityClassName: inference-partial-node
+      imagePullSecrets:
+        - name: inference-backends-image-pull-secret
+      nodeSelector:
+        gpu.nvidia.com/class: rtxp6000-8x
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      volumes:
+        - name: ckpt
+          persistentVolumeClaim:
+            claimName: k26-nvfp4-ckpt
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+      containers:
+        - name: discovery
+          image: docker.cloudsmith.io/coreweave/infr-dev/quanty-modelopt:dev
+          imagePullPolicy: Always
+          workingDir: /work
+          env:
+            - name: NCCL_DEBUG
+              value: "WARN"
+            - name: NCCL_ASYNC_ERROR_HANDLING
+              value: "1"
+            - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+              value: "1"
+            - name: HF_HOME
+              value: /work/hf-cache
+            - name: TRANSFORMERS_CACHE
+              value: /work/hf-cache
+            - name: HF_HUB_ENABLE_HF_TRANSFER
+              value: "1"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: k26-hf-secret
+                  key: HF_TOKEN
+                  optional: true
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NUM_GPUS
+              value: "8"
+            # Smoke-test target.  Override to mistralai/Mixtral-8x7B-v0.1
+            # or Qwen/Qwen3-MoE-30B-A3B by patching this env var.
+            - name: TARGET_MODEL
+              value: deepseek-ai/DeepSeek-V2-Lite
+            - name: RECIPE
+              value: /opt/quanty/modelopt_recipes/general/ptq/nvfp4_experts_only-fp8_kv.yaml
+            - name: RUN_DIR
+              value: /work/quanty/runs/discovery-$(POD_NAME)
+          resources:
+            limits:
+              nvidia.com/gpu: 8
+              memory: 700Gi
+              cpu: 32
+            requests:
+              nvidia.com/gpu: 8
+              memory: 512Gi
+              cpu: 16
+          volumeMounts:
+            - name: ckpt
+              mountPath: /work
+            - name: shm
+              mountPath: /dev/shm
+          command:
+            - /usr/bin/tini
+            - --
+            - /opt/quanty/quanty/scripts/run-discovery.sh

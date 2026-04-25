@@ -1,0 +1,125 @@
+---
+# Phase 3+ target: K2.6 NVFP4 PTQ on 4x GB200 (SM100a) using the
+# layerwise-FSDP2 fast path from this branch.
+#
+# Distinct from the team's existing k26-quantize-nvfp4 Job:
+#   * Uses the BF16 source PVC (no INT4 dequant-on-load patches needed).
+#   * Uses the new VLM-aware decoder discovery (upstream commit 8f54ba0bb).
+#   * Uses the distributed-safe layerwise checkpoint resume (commit 48d8e1a2d).
+#   * Runs on 4 GPUs single-node; layerwise materialises one decoder layer
+#     at a time so the per-layer memory budget fits in 4x192 GB = 744 Gi HBM.
+#   * Multi-node TP intentionally NOT used in v1 (deferred until we have a
+#     measurable reason to pay that complexity).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: quanty-gb200-k26-ptq-fast
+  namespace: ace-inference
+  labels:
+    app: quanty-gb200-k26-ptq-fast
+    workstream: phase3-k26-ptq
+    owner: aeldeib
+spec:
+  backoffLimit: 3   # preemption-tolerant; checkpoint resume continues from
+                    # the last fully-written layer
+  ttlSecondsAfterFinished: 604800   # 1 week
+  template:
+    metadata:
+      labels:
+        app: quanty-gb200-k26-ptq-fast
+        owner: aeldeib
+    spec:
+      restartPolicy: OnFailure
+      schedulerName: binpack-scheduler
+      priorityClassName: inference-partial-node
+      imagePullSecrets:
+        - name: inference-backends-image-pull-secret
+      nodeSelector:
+        node.coreweave.cloud/type: gb200-4x-l
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      volumes:
+        - name: bf16-source
+          persistentVolumeClaim:
+            claimName: k26-source-bf16
+            readOnly: true
+        - name: nvfp4-ckpt
+          persistentVolumeClaim:
+            claimName: k26-nvfp4-ckpt
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 256Gi
+      containers:
+        - name: ptq
+          image: docker.cloudsmith.io/coreweave/infr-dev/quanty-modelopt:dev
+          imagePullPolicy: Always
+          workingDir: /work
+          env:
+            - name: NCCL_DEBUG
+              value: "WARN"
+            - name: NCCL_ASYNC_ERROR_HANDLING
+              value: "1"
+            - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+              value: "1"
+            - name: HF_HOME
+              value: /work/hf-cache
+            - name: TRANSFORMERS_CACHE
+              value: /work/hf-cache
+            - name: HF_HUB_ENABLE_HF_TRANSFER
+              value: "1"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: k26-hf-secret
+                  key: HF_TOKEN
+                  optional: true
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NUM_GPUS
+              value: "4"
+            # BF16 source from the dedicated PVC; trust_remote_code on for the
+            # custom KimiK25/DeepseekV3 modeling code shipped with the weights.
+            - name: TARGET_MODEL
+              value: /source/k26-bf16
+            - name: RECIPE
+              value: /opt/quanty/quanty/recipes/k26-nvfp4_experts_only-fp8_kv.yaml
+            - name: CHECKPOINT_DIR
+              value: /work/quanty/checkpoints/k26-nvfp4-experts-only
+            - name: EXPORT_DIR
+              value: /work/quanty/exports/k26-nvfp4-experts-only
+            - name: CALIB_DATASET
+              value: nemotron-post-training-dataset-v2
+            - name: CALIB_SAMPLES
+              value: "2048"
+            - name: CALIB_BATCH_SIZE
+              value: "8"
+            - name: CALIB_SEQ_LEN
+              value: "2048"
+          resources:
+            limits:
+              nvidia.com/gpu: 4
+              memory: 700Gi
+              cpu: 64
+            requests:
+              nvidia.com/gpu: 4
+              memory: 600Gi
+              cpu: 48
+          volumeMounts:
+            - name: bf16-source
+              mountPath: /source/k26-bf16
+              readOnly: true
+            - name: nvfp4-ckpt
+              mountPath: /work
+            - name: shm
+              mountPath: /dev/shm
+          command:
+            - /usr/bin/tini
+            - --
+            - /opt/quanty/quanty/scripts/run-k26-ptq.sh

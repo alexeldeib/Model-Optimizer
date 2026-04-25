@@ -60,13 +60,51 @@ layerwise (per-layer materialization). No multi-node TP needed for v1.
 Smaller models give faster iteration on FSDP2-layerwise bugs that are
 architecture-class-independent.
 
-## Hardware notes
+## Hardware + cluster
+
+Cluster: `cw4637-dev-us-e-01a`, namespace `ace-inference`.
+
+| Node type        | Label selector                            | GPUs/node | HBM/node | Count |
+| ---------------- | ----------------------------------------- | --------- | -------- | ----- |
+| GB200 (SM100a)   | `node.coreweave.cloud/type=gb200-4x-l`    | 4         | 744 Gi   | 16    |
+| RTX Pro 6000 (SM120) | `gpu.nvidia.com/class=rtxp6000-8x`    | 8         | 768 Gi   | 2     |
+
+Conventions:
+
+- **Pull secret**: `inference-backends-image-pull-secret` (covers all
+  `docker.cloudsmith.io/coreweave/*` repos, including `infr-dev`)
+- **HF token**: `k26-hf-secret` / key `HF_TOKEN`
+- **Scheduler**: `binpack-scheduler`, priority `inference-partial-node`
+- **Object store**: bucket `infr`, prefix `test/ace/quants/`,
+  endpoint `http://cwlota.com` (in-cluster) / `https://cwobject.com` (laptop)
+- **Existing PVCs to use**:
+  - `k26-source-bf16` (2400 Gi) — preferred source; BF16 weights
+  - `k26-source-int4` (600 Gi) — INT4 packed; team's modelopt path uses this
+  - `k26-nvfp4-ckpt` (800 Gi) — output target + layerwise checkpoint dirs
+  - `k26-eagle3-ckpt` (50 Gi) — speculator
+  - `k26-eagle3-hidden-states` (4 Ti) — speculator hidden states
+
+Hardware caveats:
 
 - **RTX Pro 6000 (SM120)**: FlashInfer #2723 / CUTLASS #3096 — NVFP4 MoE
   grouped GEMM produces garbage output. **Use only for FSDP2 plumbing, dense
-  NVFP4, and CPU/GPU correctness checks.** Final K2.6 NVFP4 export validates
-  on GB200.
+  NVFP4, and correctness checks.** Final K2.6 NVFP4 export validates on
+  GB200.
 - **GB200 (SM100a)**: production target; NVFP4 MoE works correctly.
+
+Coexistence with team's existing path:
+
+- Team's `k26-quantize-nvfp4` Job is the source of truth for working
+  conventions; my Jobs use `-fast` / `-disco` suffixes to avoid collision.
+- Team uses INT4 source + extensive dequant-on-load patches; quanty path
+  uses BF16 source so the upstream-bound fixes stay clean.
+
+## K2.6 modeling bug to bake in
+
+`MoonViT3dEncoder.__init__` references `self.use_deterministic_attn` before
+assignment.  Fix shipped at `quanty/scripts/patch-k26-modeling.sh` (sed-based,
+idempotent).  Both the discovery and K2.6 PTQ launchers run it
+automatically when the source dir is local.
 
 ## What NOT to do (recorded so we don't drift)
 
