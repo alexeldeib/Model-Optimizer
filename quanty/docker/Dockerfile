@@ -43,28 +43,31 @@ COPY modelopt_recipes/ ./modelopt_recipes/
 COPY examples/ ./examples/
 COPY tests/ ./tests/
 
-# transformers 5.x for K2.6 / DeepseekV3 / Qwen3-MoE modeling.
-# accelerate 1.6+ for FSDP2.
-# Everything else is a thin runtime requirement of either modelopt
-# itself, the discovery harness post-processor, or the layerwise
-# checkpoint logic.
+# transformers 5.x for K2.6 / DeepseekV3 / Qwen3-MoE modeling code;
+# accelerate 1.6+ for FSDP2 layerwise composition.  Other deps under
+# ``modelopt[hf,torch]`` are left to modelopt's pyproject to resolve.
 #
-# FlashInfer / vLLM are intentionally NOT in this image: PTQ does not
-# import them, they pin a different cudnn-frontend than the NGC pytorch
-# base, and serving images install matched versions themselves.
-RUN pip install --upgrade pip wheel setuptools \
- && pip install \
+# The NGC PyTorch image ships a global ``PIP_CONSTRAINT`` file that pins
+# every base-image package (e.g. ``dill==0.3.9``, ``pyarrow==19.0.1``).
+# Those pins fight modern ``datasets`` (which wants ``dill<0.3.9``).
+# We disable the constraint file for this layer only; everything else
+# in the image keeps the base-image pins.
+#
+# FlashInfer / vLLM are intentionally NOT installed: PTQ does not import
+# them, and serving images install matched versions themselves.
+RUN PIP_CONSTRAINT= pip install --upgrade pip wheel setuptools \
+ && PIP_CONSTRAINT= pip install --upgrade \
         "transformers>=5.0.0" \
         "accelerate>=1.6.0" \
-        "datasets>=3.6.0" \
-        "tokenizers>=0.21.0" \
-        "huggingface_hub>=0.30.0" \
+        "datasets>=3.0.0,<4" \
+        "torchvision" \
+ && PIP_CONSTRAINT= pip install \
         "hf_transfer>=0.1.6" \
         "numpy<2.0" \
         "pyyaml>=6.0" \
         "jsonlines>=4.0.0" \
         "lm-eval>=0.4.5" \
- && pip install -e ".[hf,torch]"
+ && PIP_CONSTRAINT= pip install -e ".[hf,torch]"
 
 # Sanity probes: a busted install must fail the build, not the cluster job.
 RUN python -c "import modelopt; import modelopt.torch.quantization as mtq; \
@@ -81,10 +84,9 @@ COPY quanty/recipes/ /opt/quanty/quanty/recipes/
 # the +x bit on copy).
 RUN chmod +x /opt/quanty/quanty/scripts/*.sh /opt/quanty/quanty/scripts/*.py 2>/dev/null || true
 
-# Default to a non-root entrypoint that's friendly to k8s readiness probes.
-RUN useradd --create-home --uid 1000 --shell /bin/bash quanty \
- && chown -R quanty:quanty /opt/quanty
-USER quanty
+# NGC base image already owns UID 1000 (ubuntu user); we run as root in
+# the container.  k8s `securityContext.runAsNonRoot` / `runAsUser` is the
+# correct place to enforce non-root in production deployments.
 WORKDIR /work
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
