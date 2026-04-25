@@ -22,14 +22,6 @@
           "mode": "max"
         }
       ]
-    },
-    "args": {
-      "FLASHINFER_WHEEL": "flashinfer-python==0.6.0"
     }
-  },
-  "_TODO": [
-    "Set DEPOT_PROJECT_ID in env or via 'depot build --project <id>'.",
-    "Replace placeholder cloudsmith ref if infra-dev path changes.",
-    "For SM120-patched FlashInfer, override FLASHINFER_WHEEL via --build-arg."
-  ]
+  }
 }

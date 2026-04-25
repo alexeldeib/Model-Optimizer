@@ -5,7 +5,6 @@
 #   quanty/docker/build.sh                # builds :dev
 #   quanty/docker/build.sh sha            # also tags :sha-<short>
 #   quanty/docker/build.sh pr 1234        # also tags :pr-1234
-#   FLASHINFER_WHEEL=... quanty/docker/build.sh   # override wheel pin
 
 set -euo pipefail
 
@@ -46,7 +45,6 @@ depot build \
     --project "${DEPOT_PROJECT_ID}" \
     --platform linux/amd64 \
     --file quanty/docker/Dockerfile \
-    --build-arg "FLASHINFER_WHEEL=${FLASHINFER_WHEEL:-flashinfer-python==0.6.0}" \
     --push \
     "${TAG_FLAGS[@]}" \
     .
