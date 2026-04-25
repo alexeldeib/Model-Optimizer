@@ -248,12 +248,18 @@ def test_hf_decoder_discoverer_registration_path():
 def _make_vlm_wrapper(causal_lm, sub_attr):
     """Construct a PreTrainedModel that holds *causal_lm* at ``self.<sub_attr>``.
 
-    Synthesises the structural shape of HF *ForConditionalGeneration* VLMs
-    (KimiK25, Llava, Qwen2VL, ...) without pulling a real VLM dependency.
+    Synthesises the structural shape of HF ``*ForConditionalGeneration``
+    VLMs (KimiK25, Llava, Qwen2VL, ...) without pulling a real VLM
+    dependency.  The ``_supports_sdpa`` etc. class attrs are required by
+    transformers 5.x's ``PreTrainedModel.__init__`` even though the
+    wrapper is never run forward.
     """
 
     class _VLMWrapper(transformers.PreTrainedModel):
         config_class = type(causal_lm.config)
+        _supports_sdpa = True
+        _supports_flash_attn = True
+        _supports_flash_attn_2 = True
 
         def __init__(self, inner):
             super().__init__(inner.config)
@@ -278,6 +284,7 @@ def test_get_homogeneous_hf_decoder_layers_returns_none_for_unwrapped():
 
     class _Empty(transformers.PreTrainedModel):
         config_class = transformers.LlamaConfig
+        _supports_sdpa = True
 
         def forward(self, *args, **kwargs):  # pragma: no cover
             return None
