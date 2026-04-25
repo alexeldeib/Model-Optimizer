@@ -7,21 +7,6 @@
     "platforms": ["linux/amd64"],
     "tags": [
       "docker.cloudsmith.io/coreweave/infr-dev/quanty-modelopt:dev"
-    ],
-    "cache": {
-      "from": [
-        {
-          "type": "registry",
-          "ref": "docker.cloudsmith.io/coreweave/infr-dev/quanty-modelopt:cache"
-        }
-      ],
-      "to": [
-        {
-          "type": "registry",
-          "ref": "docker.cloudsmith.io/coreweave/infr-dev/quanty-modelopt:cache",
-          "mode": "max"
-        }
-      ]
-    }
+    ]
   }
 }
