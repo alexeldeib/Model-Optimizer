@@ -12,8 +12,10 @@ set -euo pipefail
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "${REPO_ROOT}"
 
-: "${DEPOT_PROJECT_ID:?Set DEPOT_PROJECT_ID before running (depot.dev project)}"
-: "${DEPOT_TOKEN:?Set DEPOT_TOKEN — see depot.dev/docs/cli/authentication}"
+# DEPOT_PROJECT_ID defaults to the org's `default` project; override if you
+# want builds in a different project (e.g. `lumen`).  DEPOT_TOKEN is not
+# required when the depot CLI is already logged in via `depot login`.
+: "${DEPOT_PROJECT_ID:=3w53ndbslf}"
 
 REGISTRY="docker.cloudsmith.io/coreweave/infr-dev"
 IMAGE="${REGISTRY}/quanty-modelopt"
