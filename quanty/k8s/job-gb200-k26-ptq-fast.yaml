@@ -84,15 +84,15 @@ spec:
                   fieldPath: metadata.name
             - name: NUM_GPUS
               value: "4"
-            # ``Kimi-K2.6-DeepseekV3`` is the inner LLM core
-            # (config.json + safetensors only, no trust_remote_code
-            # modeling files).  transformers 5.x's built-in DeepseekV3
-            # implementation handles the architecture natively, avoiding
-            # the MoonViT3d use_deterministic_attn modeling bug.  Switch
-            # to ``Kimi-K2.6-BF16`` only if you need the multimodal
-            # wrapper (vision encoder).
+            # ``Kimi-K2.6-BF16`` is the full multimodal model with
+            # ``modeling_kimi_k25.py`` + ``tokenization_kimi.py``.  The
+            # launcher symlinks safetensors into a writable scratch and
+            # patches the MoonViT3d use_deterministic_attn bug there;
+            # the read-only PVC source is untouched.  We use this dir
+            # (not the lighter Kimi-K2.6-DeepseekV3 sibling) because the
+            # tokenizer files only ship with the multimodal variant.
             - name: TARGET_MODEL
-              value: /source/k26-bf16/Kimi-K2.6-DeepseekV3
+              value: /source/k26-bf16/Kimi-K2.6-BF16
             - name: RECIPE
               value: /opt/quanty/quanty/recipes/k26-nvfp4_experts_only-fp8_kv.yaml
             - name: CHECKPOINT_DIR

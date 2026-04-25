@@ -34,9 +34,20 @@ set -euo pipefail
 
 mkdir -p "${CHECKPOINT_DIR}" "${EXPORT_DIR}"
 
-# Patch the K2.6 modeling bug if the source dir is local.
+# Build a writable scratch view of the source dir so the K2.6 modeling
+# patch can apply without touching the read-only source PVC.  Tokenizer
+# + small files are copied (a few MB total); safetensors are symlinked.
+SCRATCH="${CHECKPOINT_DIR%/*}/k26-source-scratch"
 if [[ -d "${TARGET_MODEL}" ]]; then
-    /opt/quanty/quanty/scripts/patch-k26-modeling.sh "${TARGET_MODEL}" || true
+    mkdir -p "${SCRATCH}"
+    find "${TARGET_MODEL}" -maxdepth 1 -type f -name "*.safetensors" \
+        -exec ln -sf {} "${SCRATCH}/" \;
+    # Everything else (.py, .json, .jinja, .model) gets a real copy so the
+    # in-place sed patch can write to it.
+    find "${TARGET_MODEL}" -maxdepth 1 -type f \
+        ! -name "*.safetensors" -exec cp -n {} "${SCRATCH}/" \;
+    /opt/quanty/quanty/scripts/patch-k26-modeling.sh "${SCRATCH}" || true
+    TARGET_MODEL="${SCRATCH}"
 fi
 
 cd /opt/quanty
@@ -50,11 +61,10 @@ LOG="${EXPORT_DIR}/run.log"
 # not expose --calib_seq or --layerwise_checkpoint_dir as flags; sequence
 # length comes from the dataset preset and the checkpoint dir is recipe-
 # scoped.
-# --trust_remote_code is omitted: the Kimi-K2.6-DeepseekV3 source dir
-# carries only config.json + safetensors, and transformers 5.x has a
-# built-in DeepseekV3 implementation that handles the architecture
-# natively.  Re-add the flag only if you switch TARGET_MODEL to the
-# Kimi-K2.6-BF16 multimodal wrapper (with custom modeling files).
+# --trust_remote_code is required because the K2.6 BF16 source ships
+# custom ``modeling_kimi_k25.py`` (multimodal wrapper) and
+# ``tokenization_kimi.py`` (tiktoken-based BPE) that are not built-in
+# to transformers.  The patched copy lives in ${SCRATCH}.
 torchrun \
     --nproc-per-node="${NUM_GPUS}" \
     --rdzv-backend=c10d \
@@ -66,4 +76,5 @@ torchrun \
     --batch_size "${CALIB_BATCH}" \
     --dataset "${CALIB_DATASET}" \
     --export_path "${EXPORT_DIR}" \
+    --trust_remote_code \
     2>&1 | tee "${LOG}"
