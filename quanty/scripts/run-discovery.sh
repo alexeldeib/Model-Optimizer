@@ -65,7 +65,6 @@ torchrun \
     --recipe "${RECIPE}" \
     --calib_size "${CALIB_SAMPLES}" \
     --batch_size "${CALIB_BATCH}" \
-    --calib_seq "${CALIB_SEQ}" \
     --dataset cnn_dailymail \
     --export_path "${EXPORT}" \
     --trust_remote_code \
@@ -82,6 +81,7 @@ log = open(log_path, errors="replace").read() if os.path.exists(log_path) else "
 
 # Heuristics for known failure-mode signals.
 SIGNALS = [
+    ("argparse_error",        r"unrecognized arguments|error: argument"),
     ("checkpoint_state_raise", r"Layerwise calibration checkpointing is not supported"),
     ("oom",                   r"CUDA out of memory|OutOfMemoryError"),
     ("nccl_timeout",          r"NCCL .* timed out|Watchdog caught collective"),
@@ -93,6 +93,7 @@ SIGNALS = [
     ("kimi_modeling_bug",     r"use_deterministic_attn"),
     ("gptq_hessian",          r"GPTQHelper|computing Hessian"),
     ("expert_routing",        r"expert.*not.*calibrated|amax is None"),
+    ("hf_download_fail",      r"Cannot resolve|repository not found|gated repo|401 Client Error"),
 ]
 hits = {name: bool(re.search(pat, log)) for name, pat in SIGNALS}
 

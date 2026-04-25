@@ -43,9 +43,13 @@ cd /opt/quanty
 
 LOG="${EXPORT_DIR}/run.log"
 
-# Layerwise calibration is enabled by the recipe (`layerwise: true` in
-# nvfp4_experts_only-fp8_kv variants), so we just forward --recipe and let
-# mtq.quantize dispatch into layerwise_calibrate.
+# Layerwise calibration + checkpoint dir are enabled by the recipe yaml
+# (``layerwise: true`` and ``layerwise_checkpoint_dir`` under the
+# ``algorithm`` section), so we just forward --recipe and let
+# mtq.quantize dispatch into layerwise_calibrate.  multinode_ptq.py does
+# not expose --calib_seq or --layerwise_checkpoint_dir as flags; sequence
+# length comes from the dataset preset and the checkpoint dir is recipe-
+# scoped.
 torchrun \
     --nproc-per-node="${NUM_GPUS}" \
     --rdzv-backend=c10d \
@@ -55,9 +59,7 @@ torchrun \
     --recipe "${RECIPE}" \
     --calib_size "${CALIB_SAMPLES}" \
     --batch_size "${CALIB_BATCH}" \
-    --calib_seq "${CALIB_SEQ_LEN}" \
     --dataset "${CALIB_DATASET}" \
     --export_path "${EXPORT_DIR}" \
     --trust_remote_code \
-    --layerwise_checkpoint_dir "${CHECKPOINT_DIR}" \
     2>&1 | tee "${LOG}"
