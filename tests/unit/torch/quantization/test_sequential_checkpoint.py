@@ -167,9 +167,11 @@ def _patch_distributed(monkeypatch, *, size: int, rank: int):
     from modelopt.torch.quantization.utils import layerwise_calib as lwc
     from modelopt.torch.utils import distributed as mdist
 
+    # Stubs accept ``group=None`` because callers in modelopt
+    # (e.g. ``dist.is_master``) pass it through.
     monkeypatch.setattr(mdist, "is_initialized", lambda: True)
-    monkeypatch.setattr(mdist, "size", lambda: size)
-    monkeypatch.setattr(mdist, "rank", lambda: rank)
+    monkeypatch.setattr(mdist, "size", lambda group=None: size)
+    monkeypatch.setattr(mdist, "rank", lambda group=None: rank)
 
     barrier_calls = {"n": 0}
 
