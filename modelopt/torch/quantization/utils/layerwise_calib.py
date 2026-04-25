@@ -461,6 +461,17 @@ def _remap_output_metadata_device(meta: tuple, device: torch.device) -> tuple:
     return meta
 
 
+def _is_rank0() -> bool:
+    """Whether this process is rank-0 (or the only process)."""
+    return not (dist.is_initialized() and dist.size() > 1) or dist.rank() == 0
+
+
+def _barrier() -> None:
+    """Distributed barrier; no-op outside a multi-process job."""
+    if dist.is_initialized() and dist.size() > 1:
+        torch.distributed.barrier()
+
+
 def _read_manifest(checkpoint_dir: str) -> dict | None:
     """Read manifest.json from *checkpoint_dir*. Returns None if missing or corrupt."""
     path = os.path.join(checkpoint_dir, "manifest.json")
@@ -474,7 +485,13 @@ def _read_manifest(checkpoint_dir: str) -> dict | None:
 
 
 def _write_manifest(checkpoint_dir: str, last_completed_layer: int, num_layers: int) -> None:
-    """Atomically write manifest.json."""
+    """Atomically write manifest.json from rank-0 only.
+
+    Other ranks no-op; callers must follow with a barrier before any rank
+    reads the manifest back.
+    """
+    if not _is_rank0():
+        return
     path = os.path.join(checkpoint_dir, "manifest.json")
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
@@ -498,17 +515,27 @@ def _save_layer(
     next_inputs: list | None,
     num_layers: int,
 ) -> None:
-    """Save a single layer checkpoint and update the manifest atomically."""
-    d = _layer_dir(checkpoint_dir, idx)
-    if os.path.isdir(d):
-        shutil.rmtree(d)
-    os.makedirs(d)
-    torch.save(weights, os.path.join(d, "weights.pt"))
-    torch.save(qstate, os.path.join(d, "quantizer_state.pt"))
-    torch.save(output_meta, os.path.join(d, "output_meta.pt"))
-    if next_inputs is not None:
-        torch.save(next_inputs, os.path.join(d, "next_inputs.pt"))
-    _write_manifest(checkpoint_dir, idx, num_layers)
+    """Save a single layer checkpoint and update the manifest atomically.
+
+    Distributed jobs (FSDP2, DDP) gather weights to local-replicated tensors
+    before calling save (via ``enable_weight_access_and_writeback``), so all
+    ranks hold identical CPU tensors at this point.  Only rank-0 writes; all
+    ranks barrier afterwards so subsequent steps see the on-disk state.
+    """
+    if _is_rank0():
+        d = _layer_dir(checkpoint_dir, idx)
+        if os.path.isdir(d):
+            shutil.rmtree(d)
+        os.makedirs(d)
+        torch.save(weights, os.path.join(d, "weights.pt"))
+        torch.save(qstate, os.path.join(d, "quantizer_state.pt"))
+        torch.save(output_meta, os.path.join(d, "output_meta.pt"))
+        if next_inputs is not None:
+            torch.save(next_inputs, os.path.join(d, "next_inputs.pt"))
+        # Manifest is written last so a crash mid-write leaves the prior
+        # manifest pointing at the previous fully-written layer.
+        _write_manifest(checkpoint_dir, idx, num_layers)
+    _barrier()
 
 
 def detect_resume_point(checkpoint_dir: str) -> tuple[int, dict] | None:
@@ -532,33 +559,36 @@ def detect_resume_point(checkpoint_dir: str) -> tuple[int, dict] | None:
 class _CheckpointState:
     """Manages checkpoint save and restore for layerwise calibration.
 
-    Handles both saving per-layer checkpoints during calibration and
-    restoring from a previous partial run.
+    Saves per-layer checkpoints during calibration and restores them on
+    resume from a previous partial run.
 
-    .. todo::
-        Support distributed checkpoint save/restore for FSDP2:
-        use ``torch.distributed.checkpoint`` (or save only from rank 0 + barrier)
-        and broadcast restored state to all ranks during resume.
+    Distributed semantics (FSDP2 / DDP) assume a shared filesystem visible
+    from every rank: rank-0 writes, all ranks barrier, then any rank may
+    read.  Inputs to :meth:`save` are already rank-replicated on CPU
+    because :func:`enable_weight_access_and_writeback` gathers DTensor
+    params before materialisation, so all ranks would otherwise write
+    identical bytes -- which is wasteful and races.  Non-shared-FS
+    topologies need a broadcast-on-resume design (rank-0 load +
+    ``dist.broadcast_object_list``); not implemented here.
     """
 
     def __init__(self, checkpoint_dir: str, num_layers: int, start_layer: int = 0):
-        if dist.is_initialized() and dist.size() > 1:
-            raise RuntimeError(
-                "Layerwise calibration checkpointing is not supported in "
-                "multi-process distributed jobs (e.g. FSDP2). "
-                "Use single-process calibration or disable checkpointing."
-            )
-
         self.checkpoint_dir = checkpoint_dir
         self.num_layers = num_layers
         self.start_layer = start_layer
 
     @classmethod
     def from_folder(cls, checkpoint_dir: str | None, num_layers: int) -> _CheckpointState | None:
-        """Create from folder. Detects resume point. Returns None if no checkpoint_dir."""
+        """Create from folder. Detects resume point. Returns None if no checkpoint_dir.
+
+        Under FSDP2 / DDP, only rank-0 creates the directory; all ranks then
+        barrier to ensure the directory exists before any rank reads from it.
+        """
         if not checkpoint_dir:
             return None
-        os.makedirs(checkpoint_dir, exist_ok=True)
+        if _is_rank0():
+            os.makedirs(checkpoint_dir, exist_ok=True)
+        _barrier()
         info = detect_resume_point(checkpoint_dir)
         if info is not None:
             manifest_num_layers = info[1].get("num_layers")
