@@ -43,7 +43,7 @@ done
 
 depot build \
     --project "${DEPOT_PROJECT_ID}" \
-    --platform linux/amd64 \
+    --platform linux/amd64,linux/arm64 \
     --file quanty/docker/Dockerfile \
     --push \
     "${TAG_FLAGS[@]}" \
