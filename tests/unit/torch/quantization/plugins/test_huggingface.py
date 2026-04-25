@@ -243,3 +243,44 @@ def test_hf_decoder_discoverer_registration_path():
     assert LayerActivationCollector.get_decoder_layers(model) is get_homogeneous_hf_decoder_layers(
         model
     )
+
+
+def _make_vlm_wrapper(causal_lm, sub_attr):
+    """Construct a PreTrainedModel that holds *causal_lm* at ``self.<sub_attr>``.
+
+    Synthesises the structural shape of HF *ForConditionalGeneration* VLMs
+    (KimiK25, Llava, Qwen2VL, ...) without pulling a real VLM dependency.
+    """
+
+    class _VLMWrapper(transformers.PreTrainedModel):
+        config_class = type(causal_lm.config)
+
+        def __init__(self, inner):
+            super().__init__(inner.config)
+            setattr(self, sub_attr, inner)
+
+        def forward(self, *args, **kwargs):  # pragma: no cover - not exercised
+            return getattr(self, sub_attr)(*args, **kwargs)
+
+    return _VLMWrapper(causal_lm)
+
+
+@pytest.mark.parametrize("sub_attr", ["language_model", "text_model"])
+def test_get_homogeneous_hf_decoder_layers_vlm(sub_attr):
+    """VLM container exposes inner causal-LM via .language_model or .text_model."""
+    inner = get_tiny_llama()
+    vlm = _make_vlm_wrapper(inner, sub_attr=sub_attr)
+    assert get_homogeneous_hf_decoder_layers(vlm) is inner.model.layers
+
+
+def test_get_homogeneous_hf_decoder_layers_returns_none_for_unwrapped():
+    """PreTrainedModel without .model.layers / .language_model / .text_model."""
+
+    class _Empty(transformers.PreTrainedModel):
+        config_class = transformers.LlamaConfig
+
+        def forward(self, *args, **kwargs):  # pragma: no cover
+            return None
+
+    empty = _Empty(transformers.LlamaConfig(num_hidden_layers=1))
+    assert get_homogeneous_hf_decoder_layers(empty) is None

@@ -1480,8 +1480,21 @@ def get_homogeneous_hf_decoder_layers(model: nn.Module) -> nn.ModuleList | None:
     if not _is_supported_hf_model(model):
         return None
 
+    # *ForCausalLM (LlamaForCausalLM, DeepseekV3ForCausalLM, ...).
     if hasattr(model, "model") and hasattr(model.model, "layers"):
         return model.model.layers
+
+    # *ForConditionalGeneration VLMs hold the inner causal-LM at
+    # ``language_model`` (Kimi-K2.5/2.6, Llava, Qwen2VL, ...) or
+    # ``text_model`` (older HF VLM variants).
+    for attr in ("language_model", "text_model"):
+        sub = getattr(model, attr, None)
+        if sub is None:
+            continue
+        if hasattr(sub, "model") and hasattr(sub.model, "layers"):
+            return sub.model.layers
+        if hasattr(sub, "layers"):
+            return sub.layers
 
     return None
 
