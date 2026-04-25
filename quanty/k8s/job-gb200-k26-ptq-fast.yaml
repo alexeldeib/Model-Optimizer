@@ -84,10 +84,15 @@ spec:
                   fieldPath: metadata.name
             - name: NUM_GPUS
               value: "4"
-            # BF16 source from the dedicated PVC; trust_remote_code on for the
-            # custom KimiK25/DeepseekV3 modeling code shipped with the weights.
+            # ``Kimi-K2.6-DeepseekV3`` is the inner LLM core
+            # (config.json + safetensors only, no trust_remote_code
+            # modeling files).  transformers 5.x's built-in DeepseekV3
+            # implementation handles the architecture natively, avoiding
+            # the MoonViT3d use_deterministic_attn modeling bug.  Switch
+            # to ``Kimi-K2.6-BF16`` only if you need the multimodal
+            # wrapper (vision encoder).
             - name: TARGET_MODEL
-              value: /source/k26-bf16
+              value: /source/k26-bf16/Kimi-K2.6-DeepseekV3
             - name: RECIPE
               value: /opt/quanty/quanty/recipes/k26-nvfp4_experts_only-fp8_kv.yaml
             - name: CHECKPOINT_DIR

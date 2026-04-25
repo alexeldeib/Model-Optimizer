@@ -50,6 +50,11 @@ LOG="${EXPORT_DIR}/run.log"
 # not expose --calib_seq or --layerwise_checkpoint_dir as flags; sequence
 # length comes from the dataset preset and the checkpoint dir is recipe-
 # scoped.
+# --trust_remote_code is omitted: the Kimi-K2.6-DeepseekV3 source dir
+# carries only config.json + safetensors, and transformers 5.x has a
+# built-in DeepseekV3 implementation that handles the architecture
+# natively.  Re-add the flag only if you switch TARGET_MODEL to the
+# Kimi-K2.6-BF16 multimodal wrapper (with custom modeling files).
 torchrun \
     --nproc-per-node="${NUM_GPUS}" \
     --rdzv-backend=c10d \
@@ -61,5 +66,4 @@ torchrun \
     --batch_size "${CALIB_BATCH}" \
     --dataset "${CALIB_DATASET}" \
     --export_path "${EXPORT_DIR}" \
-    --trust_remote_code \
     2>&1 | tee "${LOG}"
