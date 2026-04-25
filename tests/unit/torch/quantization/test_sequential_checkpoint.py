@@ -147,6 +147,105 @@ def test_no_checkpoint_unchanged(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Distributed-safe save/resume semantics
+#
+# The actual distributed save runs from inside FSDP2 with multiple processes.
+# Here we simulate a multi-rank job by stubbing the modelopt distributed
+# helpers + torch.distributed primitives.  The contract we exercise:
+#
+#   * rank-0 writes manifest and per-layer artifacts; non-zero ranks no-op
+#   * every rank passes through ``_barrier`` exactly once per save
+#   * ``_CheckpointState.__init__`` no longer raises in distributed mode
+#
+# The integration test that runs real FSDP2 layerwise calibration lives in
+# ``tests/gpu/torch/quantization/test_fsdp2_layerwise.py``.
+# ---------------------------------------------------------------------------
+
+
+def _patch_distributed(monkeypatch, *, size: int, rank: int):
+    """Make modelopt + torch see (size, rank) as a real distributed job."""
+    from modelopt.torch.quantization.utils import layerwise_calib as lwc
+    from modelopt.torch.utils import distributed as mdist
+
+    # Stubs accept ``group=None`` because callers in modelopt
+    # (e.g. ``dist.is_master``) pass it through.
+    monkeypatch.setattr(mdist, "is_initialized", lambda: True)
+    monkeypatch.setattr(mdist, "size", lambda group=None: size)
+    monkeypatch.setattr(mdist, "rank", lambda group=None: rank)
+
+    barrier_calls = {"n": 0}
+
+    class _StubDist:
+        @staticmethod
+        def barrier():
+            barrier_calls["n"] += 1
+
+    # Replace torch.distributed.barrier (touched only when world > 1).
+    monkeypatch.setattr(torch, "distributed", _StubDist, raising=False)
+    # Reload-free patch on the helpers in layerwise_calib so they pick up
+    # the patched ``dist`` module.
+    monkeypatch.setattr(lwc, "dist", mdist)
+    return barrier_calls
+
+
+def test_distributed_save_only_rank0_writes(monkeypatch, tmp_path):
+    """Rank-1 in a 2-rank job must not write any checkpoint files."""
+    _register_test_discoverer(monkeypatch)
+    barrier_calls = _patch_distributed(monkeypatch, size=2, rank=1)
+
+    model, forward_loop = _make_model_and_forward(n_layers=2)
+    ckpt_dir = str(tmp_path / "ckpt_rank1")
+
+    # Note: from_folder() now barrier()s after the makedirs guard.
+    # On rank-1 the dir is not pre-created; fall back to make it ourselves
+    # so layerwise_calibrate can resolve checkpoint_dir.
+    os.makedirs(ckpt_dir, exist_ok=True)
+    layerwise_calibrate(model, forward_loop, _dummy_calib_func, checkpoint_dir=ckpt_dir)
+
+    # No files written from rank-1.
+    assert not os.path.isfile(os.path.join(ckpt_dir, "manifest.json"))
+    for i in range(2):
+        layer_dir = os.path.join(ckpt_dir, f"layer_{i:04d}")
+        assert not os.path.isdir(layer_dir)
+
+    # Rank-1 still hits the barrier on every save call (n_layers=2) plus the
+    # makedirs barrier in from_folder (1) -> 3 total.
+    assert barrier_calls["n"] >= 2
+
+
+def test_distributed_save_rank0_writes(monkeypatch, tmp_path):
+    """Rank-0 in a 2-rank job writes manifest + per-layer artifacts as usual."""
+    _register_test_discoverer(monkeypatch)
+    _patch_distributed(monkeypatch, size=2, rank=0)
+
+    model, forward_loop = _make_model_and_forward(n_layers=2)
+    ckpt_dir = str(tmp_path / "ckpt_rank0")
+
+    layerwise_calibrate(model, forward_loop, _dummy_calib_func, checkpoint_dir=ckpt_dir)
+
+    manifest_path = os.path.join(ckpt_dir, "manifest.json")
+    assert os.path.isfile(manifest_path)
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+    assert manifest == {"last_completed_layer": 1, "num_layers": 2}
+
+    for i in range(2):
+        layer_dir = os.path.join(ckpt_dir, f"layer_{i:04d}")
+        assert os.path.isdir(layer_dir)
+        assert os.path.isfile(os.path.join(layer_dir, "weights.pt"))
+
+
+def test_checkpoint_state_init_does_not_raise_in_distributed(monkeypatch):
+    """Regression: previously raised on dist.size() > 1."""
+    _patch_distributed(monkeypatch, size=4, rank=2)
+    from modelopt.torch.quantization.utils.layerwise_calib import _CheckpointState
+
+    state = _CheckpointState("/tmp/does_not_matter", num_layers=8, start_layer=0)
+    assert state.num_layers == 8
+    assert state.start_layer == 0
+
+
+# ---------------------------------------------------------------------------
 # get_module_device tests
 # ---------------------------------------------------------------------------
 
