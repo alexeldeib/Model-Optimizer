@@ -57,7 +57,36 @@ else
     echo "skip: ${DEEPSEEK} not present" >&2
 fi
 
-# Bug 3: K2.6's ``tokenization_kimi.py`` imports
+# Bug 3 (deepseek): the bundled ``modeling_deepseek.py`` does an
+# unconditional ``from flash_attn import flash_attn_func, flash_attn_varlen_func``.
+# Our depot image pre-installs flash_attn, but its C extension was
+# built against a different torch ABI (the warning at startup is
+# ``undefined symbol: _ZN3c104cuda29c10_cuda_check_implementation...``).
+# Module-load fails before the runtime ``HAS_FLASH_ATTN`` gate ever
+# fires.  Wrap the import in try/except + None fallback so the file
+# loads cleanly and downstream gates degrade to native attention.
+if [[ -f "${DEEPSEEK}" ]]; then
+    if grep -q "^from flash_attn import flash_attn_func, flash_attn_varlen_func" "${DEEPSEEK}"; then
+        python3 - "${DEEPSEEK}" <<'PY'
+import sys, pathlib
+path = pathlib.Path(sys.argv[1])
+src = path.read_text()
+old = "from flash_attn import flash_attn_func, flash_attn_varlen_func"
+new = (
+    "try:  # quanty: flash_attn C ext can be ABI-incompatible with the bundled torch\n"
+    "    from flash_attn import flash_attn_func, flash_attn_varlen_func\n"
+    "except ImportError:\n"
+    "    flash_attn_func = None\n"
+    "    flash_attn_varlen_func = None\n"
+)
+if old in src:
+    path.write_text(src.replace(old, new))
+PY
+        echo "patched flash_attn guard: ${DEEPSEEK}"
+    fi
+fi
+
+# Bug 4: K2.6's ``tokenization_kimi.py`` imports
 # ``bytes_to_unicode`` from ``transformers.convert_slow_tokenizer``.
 # That re-export was dropped in transformers 5.x (it now lives only
 # under ``transformers.models.gpt2.tokenization_gpt2``).  Inline the
