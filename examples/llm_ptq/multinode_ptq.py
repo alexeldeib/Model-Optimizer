@@ -164,6 +164,19 @@ def load_and_prepare_model(
         )
     model.eval()
     model.requires_grad_(False)
+    # Disable KV cache during calibration: layerwise_calibrate replays
+    # captured (args, kwargs_input) tuples through each layer multiple
+    # times to collect GPTQ Hessians.  transformers 5.x's DynamicCache
+    # mutates in place across forwards, so the second replay sees
+    # k_len=2*q_len while the captured attention_mask is still q_len-wide,
+    # raising ``RuntimeError: The expanded size of the tensor (...) must
+    # match the existing size (...) at non-singleton dimension 3``.  The
+    # cache reset in model_calib.py:1657-1666 only zeroes the kwargs
+    # reference; the layer-internal mutation isn't covered.  PTQ never
+    # needs the cache, so disabling it at the config level is the
+    # conservative correct fix.
+    if hasattr(model, "config") and hasattr(model.config, "use_cache"):
+        model.config.use_cache = False
     model_type = get_model_type(model)
     # Need the original architectures for export
     # FSDP prefix is added to the architectures for FSDP2 wrapped models
