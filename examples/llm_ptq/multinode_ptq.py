@@ -393,13 +393,20 @@ def load_and_prepare_model(
     # Replicate-placement DTensors that the DTensor dispatcher's
     # embedding kernel can handle correctly.
     fully_shard(model, reshard_after_forward=False)
-    model.unshard()
 
     # No ``model.to_empty(...)`` call: it would clobber non-meta buffers
     # (RoPE inv_freq etc.) that we just moved up, breaking forward.
     # ``set_model_state_dict`` allocates real storage for meta param
     # shards on first write, so we go straight to the loader.
     _load_sharded_weights_from_safetensors(model, model_path, accelerator)
+
+    # Unshard the top-level FSDP unit AFTER weights are loaded.  Now
+    # embed_tokens / lm_head / final_layernorm are materialised as
+    # Replicate-placement DTensors that the DTensor dispatcher's
+    # embedding kernel can handle directly.
+    if accelerator.is_main_process:
+        print("Unsharding top-level FSDP unit (embed_tokens, lm_head, final_layernorm)...")
+    model.unshard()
 
     calibration_dataloader = accelerator.prepare(calib_dataloader)
 
