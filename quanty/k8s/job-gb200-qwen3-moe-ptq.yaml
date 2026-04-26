@@ -1,0 +1,133 @@
+---
+# E2E test target: Qwen/Qwen3-30B-A3B on 4x GB200 (SM100a).
+#
+# Purpose: validate the upstream commits + full FSDP2 + layerwise + GPTQ
+# + NVFP4 export pipeline on a MoE that fits in 4-GPU HBM, isolating
+# scale issues from correctness issues.  Qwen3-30B-A3B has the same
+# DeepseekV3-family MoE shape as K2.6 but at ~60 GB BF16 (vs K2.6's
+# ~2 TB).  Built-in transformers 5.x support, no trust_remote_code,
+# no MoonViT modeling-bug patch needed.
+#
+# Recipe: upstream ``nvfp4_experts_only-fp8_kv.yaml`` -- exercises the
+# layerwise=true path that the distributed-checkpoint upstream commit
+# is designed for, with the experts-only NVFP4 selectors that match
+# Qwen3 MoE's ``*mlp.experts.*`` paths.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: quanty-gb200-qwen3-moe-ptq
+  namespace: ace-inference
+  labels:
+    app: quanty-gb200-qwen3-moe-ptq
+    workstream: e2e-validation
+    owner: aeldeib
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels:
+        app: quanty-gb200-qwen3-moe-ptq
+        owner: aeldeib
+    spec:
+      restartPolicy: OnFailure
+      schedulerName: binpack-scheduler
+      priorityClassName: inference-partial-node
+      imagePullSecrets:
+        - name: inference-backends-image-pull-secret
+      nodeSelector:
+        node.coreweave.cloud/type: gb200-4x-l
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      volumes:
+        - name: ckpt
+          persistentVolumeClaim:
+            claimName: k26-nvfp4-ckpt
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 128Gi
+      containers:
+        - name: ptq
+          image: docker.cloudsmith.io/coreweave/infr-dev/quanty-modelopt:dev
+          imagePullPolicy: Always
+          workingDir: /work
+          env:
+            - name: NCCL_DEBUG
+              value: "WARN"
+            - name: NCCL_ASYNC_ERROR_HANDLING
+              value: "1"
+            - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+              value: "1"
+            - name: HF_HOME
+              value: /work/hf-cache
+            - name: TRANSFORMERS_CACHE
+              value: /work/hf-cache
+            - name: HF_HUB_ENABLE_HF_TRANSFER
+              value: "1"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: k26-hf-secret
+                  key: HF_TOKEN
+                  optional: true
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NUM_GPUS
+              value: "4"
+            - name: TARGET_MODEL
+              value: Qwen/Qwen3-30B-A3B
+            - name: RECIPE
+              value: /opt/quanty/modelopt_recipes/general/ptq/nvfp4_experts_only-fp8_kv.yaml
+            - name: CHECKPOINT_DIR
+              value: /work/quanty/checkpoints/qwen3-moe-nvfp4-experts-only
+            - name: EXPORT_DIR
+              value: /work/quanty/exports/qwen3-moe-nvfp4-experts-only
+            - name: CALIB_DATASET
+              value: cnn_dailymail
+            - name: CALIB_SAMPLES
+              value: "256"
+            - name: CALIB_BATCH
+              value: "4"
+          resources:
+            limits:
+              nvidia.com/gpu: 4
+              memory: 700Gi
+              cpu: 64
+            requests:
+              nvidia.com/gpu: 4
+              memory: 600Gi
+              cpu: 48
+          volumeMounts:
+            - name: ckpt
+              mountPath: /work
+            - name: shm
+              mountPath: /dev/shm
+          command:
+            - /usr/bin/tini
+            - --
+            - bash
+            - -lc
+            - |
+              # Built-in DeepseekV3-family arch -- no trust_remote_code, no scratch dir.
+              cd /opt/quanty
+              LOG="${EXPORT_DIR}/run.log"
+              mkdir -p "${CHECKPOINT_DIR}" "${EXPORT_DIR}"
+              torchrun \
+                  --nproc-per-node="${NUM_GPUS}" \
+                  --rdzv-backend=c10d \
+                  --rdzv-endpoint=localhost:0 \
+                  examples/llm_ptq/multinode_ptq.py \
+                  --pyt_ckpt_path "${TARGET_MODEL}" \
+                  --recipe "${RECIPE}" \
+                  --calib_size "${CALIB_SAMPLES}" \
+                  --batch_size "${CALIB_BATCH}" \
+                  --dataset "${CALIB_DATASET}" \
+                  --export_path "${EXPORT_DIR}" \
+                  2>&1 | tee "${LOG}"
