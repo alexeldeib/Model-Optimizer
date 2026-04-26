@@ -197,6 +197,25 @@ def _load_sharded_weights_from_safetensors(
         accelerator: Accelerator instance for rank/device info.
     """
     model_dir = Path(model_path)
+    if not model_dir.is_dir():
+        # ``model_path`` is an HF Hub repo_id, not a local directory.
+        # ``AutoConfig.from_pretrained`` already handled hub fetch for the
+        # config, but we need the safetensors files locally to read per-rank
+        # slices.  ``snapshot_download`` is idempotent and process-safe
+        # (per-file locks), so all ranks calling it concurrently is fine.
+        from huggingface_hub import snapshot_download
+
+        if accelerator.is_main_process:
+            print(f"Snapshot-downloading {model_path} from HF Hub...")
+        local = snapshot_download(
+            model_path,
+            allow_patterns=[
+                "*.safetensors",
+                "*.safetensors.index.json",
+                "config.json",
+            ],
+        )
+        model_dir = Path(local)
 
     index_file = model_dir / "model.safetensors.index.json"
     if index_file.exists():
