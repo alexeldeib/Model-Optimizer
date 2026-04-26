@@ -115,6 +115,7 @@ spec:
             - bash
             - -lc
             - |
+              set -o pipefail
               # Built-in DeepseekV3-family arch -- no trust_remote_code, no scratch dir.
               cd /opt/quanty
               LOG="${EXPORT_DIR}/run.log"

@@ -289,10 +289,21 @@ def load_and_prepare_model(
         print(f"Meta-initializing model from {model_path}...")
 
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
+    # Resolve dtype explicitly: ``from_pretrained`` special-cases the
+    # string ``"auto"`` to mean "use the config's dtype", but
+    # ``from_config`` calls ``getattr(torch, dtype)`` directly and
+    # raises ``AttributeError: module 'torch' has no attribute 'auto'``.
+    # Read config.dtype (transformers 5.x) / config.torch_dtype (legacy)
+    # and pass the resolved torch.dtype object.
+    model_dtype = getattr(config, "dtype", None) or getattr(
+        config, "torch_dtype", torch.bfloat16
+    )
+    if isinstance(model_dtype, str):
+        model_dtype = getattr(torch, model_dtype, torch.bfloat16)
     with init_empty_weights():
         with patch_compressed_linear_loading():
             model = AutoModelForCausalLM.from_config(
-                config, trust_remote_code=trust_remote_code, dtype="auto"
+                config, trust_remote_code=trust_remote_code, dtype=model_dtype
             )
 
     model.eval()
