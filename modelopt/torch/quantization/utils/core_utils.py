@@ -717,20 +717,46 @@ def get_prefixed_param_names(parent_model, target_module):
     )
 
 
-def create_fsdp_param_mapping(fsdp_param_list, model):
+def create_fsdp_param_mapping(
+    fsdp_param_list,
+    model,
+    name_to_module: dict | None = None,
+    id_to_name: dict | None = None,
+):
     """Builds a mapping from full parameter name to their corresponding FSDPParam.
 
     Args:
         fsdp_param_list (list): List of FSDPParam.
         model (nn.Module): FSDP root module.
+        name_to_module: Optional pre-computed dict mapping names to modules.
+        id_to_name: Optional pre-computed inverse mapping (``id(module) ->
+            name``).  When supplied, the per-FSDPParam module lookup is
+            O(1) instead of walking ``model.named_parameters()`` to find
+            a matching parameter id.  For PTQ export, the caller
+            (``fsdp2_aware_weight_update``) builds these once per
+            context-manager entry; without them, this function is
+            O(n_fsdp_params * n_named_parameters), which dominates
+            export time at MoE scale (e.g. ~22 minutes hang on
+            Qwen3-MoE-30B-A3B / 4x GB200 traced to this loop).
 
     Returns:
         dict: Full parameter name → FSDP parameter.
     """
+    if id_to_name is None or name_to_module is None:
+        name_to_module, id_to_name = _build_module_index(model)
     mapping = {}
     for param in fsdp_param_list:
-        # Get the module name
-        module_name = get_prefixed_param_names(model, param._module_info.module)
+        # Get the module name.  ``_get_module_name`` with the inverse
+        # id_to_name index returns the same result as the legacy
+        # get_prefixed_param_names walk -- both yield the dotted path
+        # of ``param._module_info.module`` within ``model`` -- but in
+        # O(1) instead of O(n_named_parameters).
+        module_name = _get_module_name(
+            param._module_info.module,
+            model,
+            name_to_module=name_to_module,
+            id_to_name=id_to_name,
+        )
         if module_name is not None:
             # Get the parameter name from _module_info and construct full param name
             param_name = param._module_info.param_name
@@ -862,9 +888,19 @@ def fsdp2_aware_weight_update(root_model, modules_to_update, reshard=True):
                 with enable_fake_quant(root_module):
                     root_module.unshard()
 
-            # Get FSDPParam list
+            # Get FSDPParam list.  Pass the cached module index so the
+            # per-FSDPParam lookup uses O(1) id_to_name instead of an
+            # O(n_named_parameters) walk -- without this, MoE export
+            # spends most of its wall-clock in this loop (~4e11 ops
+            # total for Qwen3-MoE-30B-A3B; observed as a 15+ minute
+            # silent CPU spin past the print_quant_summary line).
             fsdp_param_group = fully_shard.state(root_module)._fsdp_param_group
-            fsdp_param_mapping = create_fsdp_param_mapping(fsdp_param_group.fsdp_params, root_model)
+            fsdp_param_mapping = create_fsdp_param_mapping(
+                fsdp_param_group.fsdp_params,
+                root_model,
+                name_to_module=name_to_module,
+                id_to_name=id_to_name,
+            )
 
             # Assert that all the modules in the module list are present in this fsdp_param_group
             if len(modules_to_update) > 1:
