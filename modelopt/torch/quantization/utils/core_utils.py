@@ -383,7 +383,32 @@ def _get_fsdp2_mesh(module: nn.Module):
         return fsdp_state._fsdp_param_group.post_forward_mesh_info.mesh
 
 
-def _get_module_name(module: nn.Module, root_model: nn.Module, name_to_module: dict | None = None):
+def _build_module_index(
+    root_model: nn.Module,
+) -> tuple[dict[str, nn.Module], dict[int, str]]:
+    """Build the (name -> module, id(module) -> name) lookup pair for ``root_model``.
+
+    The id-keyed inverse mapping turns ``_get_module_name`` and
+    ``_get_enclosing_fsdp_module`` into O(1) lookups instead of the
+    O(n) linear scan over ``name_to_module.items()``.  Callers that
+    do many lookups against the same ``root_model`` (notably
+    :func:`fsdp2_aware_weight_update`, called once per quantized
+    linear during PTQ export) should build this once and pass both
+    halves through.
+    """
+    name_to_module = dict(root_model.named_modules())
+    id_to_name = {id(m): n for n, m in name_to_module.items()}
+    return name_to_module, id_to_name
+
+
+def _get_module_name(
+    module: nn.Module,
+    root_model: nn.Module,
+    name_to_module: dict | None = None,
+    id_to_name: dict | None = None,
+):
+    if id_to_name is not None:
+        return id_to_name.get(id(module))
     if name_to_module is None:
         name_to_module = dict(root_model.named_modules())
     target_module_name = next((name for name, m in name_to_module.items() if m is module), None)
@@ -391,22 +416,32 @@ def _get_module_name(module: nn.Module, root_model: nn.Module, name_to_module: d
 
 
 def _get_enclosing_fsdp_module(
-    module: nn.Module, root_model: nn.Module, name_to_module: dict | None = None
+    module: nn.Module,
+    root_model: nn.Module,
+    name_to_module: dict | None = None,
+    id_to_name: dict | None = None,
 ):
     """Get the enclosing FSDP module for a given module.
 
     Args:
         module: The module to find the enclosing FSDP for.
         root_model: The root model containing the module.
-        name_to_module: Optional pre-computed dict mapping names to modules (for performance).
+        name_to_module: Optional pre-computed dict mapping names to modules.
+        id_to_name: Optional pre-computed inverse mapping (``id(module) ->
+            name``).  When supplied, module lookup is O(1) instead of
+            scanning ``name_to_module.items()``.  Build via
+            :func:`_build_module_index` for callers that look up many
+            modules against the same ``root_model``.
     """
     if isinstance(module, FSDPModule):
         return module
 
-    if name_to_module is None:
-        name_to_module = dict(root_model.named_modules())
+    if name_to_module is None or id_to_name is None:
+        name_to_module, id_to_name = _build_module_index(root_model)
 
-    target_module_name = _get_module_name(module, root_model, name_to_module)
+    target_module_name = _get_module_name(
+        module, root_model, name_to_module=name_to_module, id_to_name=id_to_name
+    )
 
     if target_module_name is None:
         raise ValueError(f"Module {module} not found in the root model {root_model}.")
@@ -791,15 +826,31 @@ def fsdp2_aware_weight_update(root_model, modules_to_update, reshard=True):
     Returns:
         None
     """
+    name_to_module: dict[str, nn.Module] | None = None
+    id_to_name: dict[int, str] | None = None
     try:
         if isinstance(root_model, FSDPModule):
             # Get FSDP root module, if none is returned, then the update is not made to a submodule of an FSDPModule
             if not isinstance(modules_to_update, list):
                 modules_to_update = [modules_to_update]
 
+            # Build the module index once per call.  Both the module->root
+            # walk below and the per-parameter loop in the finally block
+            # need module-name lookups; without the inverse id map, each
+            # lookup would be O(n_modules).  For PTQ export the caller
+            # invokes this context manager once per quantized linear --
+            # ~18,000 for Qwen3-MoE, ~256,000 for K2.6 -- so even a
+            # single O(n) scan per call lifts the export to O(n^2).
+            name_to_module, id_to_name = _build_module_index(root_model)
+
             root_modules = set()
             for module in modules_to_update:
-                root_module = _get_enclosing_fsdp_module(module, root_model)
+                root_module = _get_enclosing_fsdp_module(
+                    module,
+                    root_model,
+                    name_to_module=name_to_module,
+                    id_to_name=id_to_name,
+                )
                 root_modules.add(root_module)
 
             # Ensure all modules in root_modules are the same
@@ -818,7 +869,12 @@ def fsdp2_aware_weight_update(root_model, modules_to_update, reshard=True):
             # Assert that all the modules in the module list are present in this fsdp_param_group
             if len(modules_to_update) > 1:
                 for module in modules_to_update:
-                    module_name = _get_module_name(module, root_model)
+                    module_name = _get_module_name(
+                        module,
+                        root_model,
+                        name_to_module=name_to_module,
+                        id_to_name=id_to_name,
+                    )
                     # Check if any parameter from this module is in the mapping
                     module_params_in_mapping = any(
                         f"{module_name}.{n}" in fsdp_param_mapping
@@ -837,7 +893,12 @@ def fsdp2_aware_weight_update(root_model, modules_to_update, reshard=True):
             # Update FSDPParam list
             for module in modules_to_update:
                 for param_name, param in module.named_parameters():
-                    name = _get_module_name(module, root_model)
+                    name = _get_module_name(
+                        module,
+                        root_model,
+                        name_to_module=name_to_module,
+                        id_to_name=id_to_name,
+                    )
                     name = f"{name}.{param_name}"
                     if name not in fsdp_param_mapping:
                         continue

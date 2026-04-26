@@ -492,90 +492,14 @@ def export_model(
     export_dir = Path(export_path)
     export_dir.mkdir(parents=True, exist_ok=True)
 
-    # Replace ``_get_module_name`` and ``_get_enclosing_fsdp_module``
-    # with O(1) versions that look up the module by id().  The base
-    # implementations are doubly O(n_modules) per call:
-    #
-    #     def _get_module_name(module, root_model, name_to_module=None):
-    #         if name_to_module is None:
-    #             name_to_module = dict(root_model.named_modules())   # O(n)
-    #         target_module_name = next(                                # O(n)
-    #             (name for name, m in name_to_module.items() if m is module),
-    #             None,
-    #         )
-    #         return target_module_name
-    #
-    # ``_process_quantized_modules`` calls ``fsdp2_aware_weight_update``
-    # per quantized linear (~18,000 for Qwen3-MoE, ~256,000 for K2.6).
-    # Each call walks the model via ``_get_enclosing_fsdp_module`` AND
-    # the finally block calls ``_get_module_name`` per parameter -- so
-    # the export is O(n_linears * n_modules) end-to-end.  For Qwen3-MoE
-    # that's ~1e9 ops (tens of minutes); for K2.6 ~3e10 ops (days).
-    #
-    # Two-part fix:
-    #   1. Cache ``root_model.named_modules()`` keyed on id(root_model)
-    #      so the dict is built once per export.
-    #   2. Replace the linear-scan body with an inverse mapping
-    #      ``id(module) -> name`` so module lookup is O(1).
-    #
-    # Together this drops the export to O(n_linears + n_modules).
-    # ``id()``-keyed lookup is safe within the export step because the
-    # module identity is stable for the lifetime of the cache (we
-    # discard the cache in the ``finally`` below).
-    import modelopt.torch.quantization.utils.core_utils as cu
-
-    _module_index_cache: dict[int, tuple[dict[str, nn.Module], dict[int, str]]] = {}
-
-    def _build_index(root_model: nn.Module):
-        cache_key = id(root_model)
-        cached = _module_index_cache.get(cache_key)
-        if cached is None:
-            name_to_module = dict(root_model.named_modules())
-            id_to_name = {id(m): n for n, m in name_to_module.items()}
-            cached = (name_to_module, id_to_name)
-            _module_index_cache[cache_key] = cached
-        return cached
-
-    original_get_module_name = cu._get_module_name
-    original_get_enclosing = cu._get_enclosing_fsdp_module
-
-    def patched_get_module_name(module, root_model, name_to_module=None):
-        _, id_to_name = _build_index(root_model)
-        return id_to_name.get(id(module))
-
-    def patched_get_enclosing(module, root_model, name_to_module=None):
-        from torch.distributed.fsdp import FSDPModule
-
-        if isinstance(module, FSDPModule):
-            return module
-        name_to_module, id_to_name = _build_index(root_model)
-        target_module_name = id_to_name.get(id(module))
-        if target_module_name is None:
-            raise ValueError(
-                f"Module {module} not found in the root model {root_model}."
-            )
-        current_name = target_module_name
-        while "." in current_name:
-            parent_name = ".".join(current_name.split(".")[:-1])
-            parent_module = name_to_module.get(parent_name)
-            if parent_module and isinstance(parent_module, FSDPModule):
-                return parent_module
-            current_name = parent_name
-        if isinstance(root_model, FSDPModule):
-            return root_model
-        return None
-
-    cu._get_module_name = patched_get_module_name
-    cu._get_enclosing_fsdp_module = patched_get_enclosing
-
-    try:
-        post_state_dict, hf_quant_config = _export_transformers_checkpoint(
-            model, torch.bfloat16, accelerator=accelerator
-        )
-    finally:
-        cu._get_module_name = original_get_module_name
-        cu._get_enclosing_fsdp_module = original_get_enclosing
-        _module_index_cache.clear()
+    # The upstream fix in modelopt/torch/quantization/utils/core_utils.py
+    # makes ``fsdp2_aware_weight_update`` build the module-name index
+    # once per call and pass it to ``_get_enclosing_fsdp_module`` /
+    # ``_get_module_name`` for O(1) lookup -- no monkey-patch needed
+    # at the call site.
+    post_state_dict, hf_quant_config = _export_transformers_checkpoint(
+        model, torch.bfloat16, accelerator=accelerator
+    )
 
     if accelerator.is_main_process:
         # Save hf_quant_config.json for backward compatibility
