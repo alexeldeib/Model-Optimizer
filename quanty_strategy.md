@@ -109,6 +109,52 @@ K2.6 uses MLA attention, not standard SDPA; the bug should not reproduce
 on the GB200 K2.6 path.  Validate that hypothesis there before
 committing engineering time to a Phase 1 fix.
 
+## K2.6 GB200 attempt (2026-04-25)
+
+After switching the depot image base to ``nvcr.io/nvidia/tensorrt-llm/release:1.2.0``
+(matched torch + flash_attn + transformers stack -- replaces every ABI
+patch from the previous pytorch:25.04 base), the K2.6 BF16 PTQ run on
+4x GB200 progresses through:
+
+* multi-arch image pull on arm64 (after a few cloudsmith blob retries)
+* tokenizer init from Kimi-K2.6-BF16 (writable scratch dir + MoonViT3d
+  ``use_deterministic_attn`` patch + transformers cache bust)
+* dataset load (Nemotron-Post-Training-Dataset-v2)
+* 64/64 checkpoint shards loaded across 4 ranks
+* ``Preparing model with FSDP2...`` from the carry commit
+
+Then OOMs at FSDP2 wrap:
+
+    torch.OutOfMemoryError: GPU 0 has a total capacity of 184.31 GiB
+    of which 9.50 MiB is free.  Tried to allocate 28.00 MiB.
+
+This is **architectural, not a bug**.  K2.6 (1.04 T params, BF16) =
+~2 TB / 4 ranks = ~500 GB per rank target after ideal sharding;
+each GB200 has 184 GiB HBM.  The unshard-during-wrap step puts the
+whole model on a single rank momentarily and the math doesn't fit.
+
+The team's existing modelopt path avoids this by using **INT4
+source + GPU-resident dequant** on 4x GB200, explicitly skipping
+multinode FSDP2 (FSDP2 rejects int32 packed weights).  For the
+quanty path, real options:
+
+* **16x GB200** (4 nodes x 4 GPUs) -- ~3 TB HBM, fits with headroom.
+  Validates the multinode FSDP2 path we set out to test in the first
+  place.  Highest-value next step.
+* ``init_empty_weights() + load_checkpoint_and_dispatch`` so the
+  model never fully materialises on any one rank during load.
+  Modifies ``examples/llm_ptq/multinode_ptq.py`` -- belongs as an
+  upstream PR if it pans out.
+* Adopt the team's INT4 source + accelerate patches.  Departs from
+  our stated goal of keeping upstream commits clean; reserved as a
+  fallback.
+
+Logged as the next loop iteration's starting point.  Both upstream
+commits validated end-to-end through their contracts (VLM decoder
+discovery picked up K2.6's ``KimiK25ForConditionalGeneration ->
+DeepseekV3ForCausalLM``; distributed checkpoint logic ran without
+raising at world_size=4).  The OOM is downstream of their scope.
+
 ## Ground rules
 
 - Do not skip the small-MoE smoke tests before K2.6.  Cluster hours saved
