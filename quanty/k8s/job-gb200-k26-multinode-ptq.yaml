@@ -162,6 +162,37 @@ spec:
               value: "8"
             - name: CALIB_SEQ_LEN
               value: "2048"
+            # ---- S3 upload of final export ----
+            # ``quanty-s3-creds`` carries the same CW object-store
+            # credentials the user has in ~/.aws (created via
+            # ``kubectl create secret generic quanty-s3-creds
+            # --from-literal=AWS_ACCESS_KEY_ID=... ...``).  Endpoint
+            # is the in-cluster URL ``http://cwlota.com``; from a
+            # laptop you'd use ``https://cwobject.com``.  Rank-0 of
+            # the launcher uploads ${EXPORT_DIR} to ${S3_DEST_PREFIX}
+            # after a successful torchrun.
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: quanty-s3-creds
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: quanty-s3-creds
+                  key: AWS_SECRET_ACCESS_KEY
+            - name: AWS_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: quanty-s3-creds
+                  key: AWS_REGION
+            - name: AWS_ENDPOINT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: quanty-s3-creds
+                  key: AWS_ENDPOINT_URL
+            - name: S3_DEST_PREFIX
+              value: "s3://infr/test/ace/quants/k26-nvfp4-experts-only"
           resources:
             limits:
               nvidia.com/gpu: 4

@@ -134,3 +134,44 @@ torchrun \
     --export_path "${EXPORT_DIR}" \
     --trust_remote_code \
     2>&1 | tee "${LOG}"
+
+# Rank-0 only uploads the export to s3://infr/test/ace/quants/<run-id>/.
+# All ranks complete torchrun; only rank-0 has the gathered, packed
+# weights at ${EXPORT_DIR}.  S3 creds + endpoint are injected via the
+# quanty-s3-creds k8s secret.
+if [[ "${NODE_RANK}" == "0" && -n "${S3_DEST_PREFIX:-}" && -d "${EXPORT_DIR}" ]]; then
+    echo "rank 0: uploading ${EXPORT_DIR} to ${S3_DEST_PREFIX}"
+    pip install --quiet boto3 2>&1 | tail -2 || true
+    python3 - <<PYEOF
+import os
+import pathlib
+import boto3
+
+src = pathlib.Path("${EXPORT_DIR}")
+dest = "${S3_DEST_PREFIX}".rstrip("/")
+# Parse bucket + key prefix from s3://bucket/prefix
+assert dest.startswith("s3://"), f"S3_DEST_PREFIX must be s3://...; got {dest}"
+bucket, _, prefix = dest[len("s3://"):].partition("/")
+
+session = boto3.session.Session(
+    aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+    aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+    region_name=os.environ.get("AWS_REGION", "US-EAST-04"),
+)
+s3 = session.client("s3", endpoint_url=os.environ["AWS_ENDPOINT_URL"])
+
+uploaded = 0
+total_bytes = 0
+for path in sorted(src.rglob("*")):
+    if not path.is_file():
+        continue
+    rel = path.relative_to(src).as_posix()
+    key = f"{prefix}/{rel}" if prefix else rel
+    size = path.stat().st_size
+    print(f"  uploading {rel} ({size / 1024**2:.1f} MiB) -> s3://{bucket}/{key}", flush=True)
+    s3.upload_file(str(path), bucket, key)
+    uploaded += 1
+    total_bytes += size
+print(f"upload complete: {uploaded} files, {total_bytes / 1024**3:.2f} GiB to s3://{bucket}/{prefix}")
+PYEOF
+fi
