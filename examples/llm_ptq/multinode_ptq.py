@@ -29,9 +29,14 @@ import safetensors
 import torch
 import torch.nn as nn
 from accelerate import Accelerator, init_empty_weights
+from accelerate.utils import FullyShardedDataParallelPlugin
 from example_utils import build_quant_cfg, get_tokenizer
 from modelopt.recipe import ModelOptPTQRecipe, load_recipe
-from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
+    get_model_state_dict,
+    set_model_state_dict,
+)
 from torch.distributed.fsdp import fully_shard
 from tqdm import tqdm
 from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedTokenizer, PreTrainedTokenizerFast
@@ -471,9 +476,35 @@ def export_model(
     export_dir = Path(export_path)
     export_dir.mkdir(parents=True, exist_ok=True)
 
-    post_state_dict, hf_quant_config = _export_transformers_checkpoint(
-        model, torch.bfloat16, accelerator=accelerator
-    )
+    # ``_export_transformers_checkpoint`` calls
+    # ``accelerator.get_state_dict(model)`` which, for the manual
+    # ``fully_shard`` wrap we set up in ``load_and_prepare_model``,
+    # falls through to ``model.state_dict()`` and returns DTensors
+    # rather than gathered full tensors.  Subsequent NCCL collectives
+    # in the export postprocessor hang on mismatched gathers (10-min
+    # watchdog timeout observed on Qwen3-MoE).  Replace
+    # ``accelerator.get_state_dict`` with a thin wrapper that calls
+    # ``get_model_state_dict`` directly with FULL_STATE_DICT options,
+    # which is the canonical FSDP2-aware gather and guarantees rank-0
+    # CPU receives the full unsharded weights.
+    original_get_state_dict = accelerator.get_state_dict
+
+    def _patched_get_state_dict(m, unwrap=True):
+        return get_model_state_dict(
+            m,
+            options=StateDictOptions(
+                full_state_dict=True,
+                cpu_offload=True,
+            ),
+        )
+
+    accelerator.get_state_dict = _patched_get_state_dict
+    try:
+        post_state_dict, hf_quant_config = _export_transformers_checkpoint(
+            model, torch.bfloat16, accelerator=accelerator
+        )
+    finally:
+        accelerator.get_state_dict = original_get_state_dict
 
     if accelerator.is_main_process:
         # Save hf_quant_config.json for backward compatibility
@@ -516,8 +547,24 @@ def main(args):
     np.random.seed(RAND_SEED)
     torch.manual_seed(RAND_SEED)
 
-    # Initialize accelerator
-    accelerator = Accelerator()
+    # Initialize accelerator with an FSDP2 plugin so
+    # ``accelerator.get_state_dict(model)`` knows to gather DTensors via
+    # the FSDP2 path during export.  We don't call
+    # ``accelerator.prepare(model)`` (we manually ``fully_shard`` each
+    # decoder layer in ``load_and_prepare_model``), but accelerator's
+    # state must still report DistributedType=FSDP for the export
+    # gather to use the right code path.  Without this, accelerator's
+    # default ``model.state_dict()`` returns DTensors directly and the
+    # downstream export collectives hang on mismatched gathers.
+    fsdp_plugin = FullyShardedDataParallelPlugin(
+        fsdp_version=2,
+        sharding_strategy="FULL_SHARD",
+        state_dict_type="FULL_STATE_DICT",
+        cpu_offload=False,
+        sync_module_states=False,
+        cpu_ram_efficient_loading=False,
+    )
+    accelerator = Accelerator(fsdp_plugin=fsdp_plugin)
 
     print(f"Rank: {os.environ.get('RANK', 'Not set')}")
     print(f"World Size: {os.environ.get('WORLD_SIZE', 'Not set')}")
