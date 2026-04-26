@@ -41,13 +41,33 @@ set -euo pipefail
 : "${JOB_COMPLETION_INDEX:?set JOB_COMPLETION_INDEX (k8s injects on Indexed Jobs)}"
 
 NODE_RANK="${JOB_COMPLETION_INDEX}"
-RDZV_ID="${RDZV_ID:-quanty-k26-mn-${RANDOM}}"
 
 echo "============================================================"
 echo "K2.6 multinode PTQ rank=${NODE_RANK}/${NNODES}"
 echo "  master: ${MASTER_ADDR}:${MASTER_PORT}"
-echo "  per-node gpus: ${NUM_GPUS}  rdzv_id: ${RDZV_ID}"
+echo "  per-node gpus: ${NUM_GPUS}"
 echo "============================================================"
+
+# Wait for master DNS + TCP listener before launching torchrun.
+# Headless service publishes pod-0's A record as soon as the pod
+# exists (publishNotReadyAddresses=true), but the master's TCPStore
+# isn't bound until rank-0's torchrun starts.  Ranks >= 1 retry-
+# connect with a budget; once master is reachable, torchrun's own
+# TCPStore client takes over.  Caps the total wait at 8 minutes;
+# beyond that something is structurally wrong (DNS, firewall,
+# image-pull skew) and failing fast surfaces it.
+if [[ "${NODE_RANK}" != "0" ]]; then
+    echo "rank ${NODE_RANK}: waiting for master TCPStore at ${MASTER_ADDR}:${MASTER_PORT}"
+    deadline=$(( SECONDS + 480 ))
+    until python -c "import socket,sys; s=socket.create_connection(('${MASTER_ADDR}',${MASTER_PORT}),timeout=5); s.close()" >/dev/null 2>&1; do
+        if (( SECONDS >= deadline )); then
+            echo "rank ${NODE_RANK}: timed out waiting for master after 480s" >&2
+            exit 1
+        fi
+        sleep 5
+    done
+    echo "rank ${NODE_RANK}: master reachable, launching torchrun"
+fi
 
 mkdir -p "${CHECKPOINT_DIR}" "${EXPORT_DIR}"
 
@@ -89,18 +109,22 @@ cd /opt/quanty
 # digging through pod uids.
 LOG="${EXPORT_DIR}/run.rank${NODE_RANK}.log"
 
-# torchrun multi-node rendezvous over c10d:
-#   * --nnodes / --node-rank set the world topology
-#   * --rdzv-id must match across all pods
-#   * --rdzv-endpoint is the index-0 pod via headless service DNS
-#   * --rdzv-backend=c10d uses TCP store, matches what 1-node uses
+# torchrun multi-node *static* rendezvous:
+#   * --master-addr / --master-port pin the TCPStore on rank-0
+#   * --node-rank from JOB_COMPLETION_INDEX
+#   * No --rdzv-id / --rdzv-backend: dynamic c10d rendezvous needed
+#     a per-job ID consistent across all pods, but the launcher's
+#     ${RANDOM} fallback evaluated independently in each pod's
+#     shell, so all 4 ranks landed in different rdzv groups and
+#     timed out.  Static rendezvous removes the entire rdzv-ID
+#     coordination class of bugs; with Indexed Jobs we already
+#     have unambiguous node ranks.
 torchrun \
     --nnodes="${NNODES}" \
     --nproc-per-node="${NUM_GPUS}" \
     --node-rank="${NODE_RANK}" \
-    --rdzv-id="${RDZV_ID}" \
-    --rdzv-backend=c10d \
-    --rdzv-endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
+    --master-addr="${MASTER_ADDR}" \
+    --master-port="${MASTER_PORT}" \
     examples/llm_ptq/multinode_ptq.py \
     --pyt_ckpt_path "${TARGET_MODEL}" \
     --recipe "${RECIPE}" \
