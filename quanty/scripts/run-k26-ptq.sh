@@ -36,17 +36,26 @@ mkdir -p "${CHECKPOINT_DIR}" "${EXPORT_DIR}"
 
 # Build a writable scratch view of the source dir so the K2.6 modeling
 # patch can apply without touching the read-only source PVC.  Tokenizer
-# + small files are copied (a few MB total); safetensors are symlinked.
+# + small files are real copies (a few MB total) so sed can mutate
+# them; safetensors are symlinked.
 SCRATCH="${CHECKPOINT_DIR%/*}/k26-source-scratch"
 if [[ -d "${TARGET_MODEL}" ]]; then
     mkdir -p "${SCRATCH}"
     find "${TARGET_MODEL}" -maxdepth 1 -type f -name "*.safetensors" \
         -exec ln -sf {} "${SCRATCH}/" \;
-    # Everything else (.py, .json, .jinja, .model) gets a real copy so the
-    # in-place sed patch can write to it.
+    # Force a fresh copy of patchable files every run so a re-patch
+    # actually takes effect (cp without -n / --update=none).  Errors
+    # if the source isn't a regular file; safe because find filters.
     find "${TARGET_MODEL}" -maxdepth 1 -type f \
-        ! -name "*.safetensors" -exec cp -n {} "${SCRATCH}/" \;
+        ! -name "*.safetensors" -exec cp -f {} "${SCRATCH}/" \;
     /opt/quanty/quanty/scripts/patch-k26-modeling.sh "${SCRATCH}" || true
+    # transformers caches trust_remote_code module files at
+    # $HF_HOME/modules/transformers_modules/<sanitised-name>/.  After
+    # we re-patch the scratch source, that cache is stale; clear the
+    # entry for this path so the next from_pretrained re-copies the
+    # patched files.  (transformers replaces ``-`` with ``_hyphen_``.)
+    SCRATCH_KEY=$(basename "${SCRATCH}" | sed 's/-/_hyphen_/g')
+    rm -rf "${HF_HOME:-$HOME/.cache/huggingface}/modules/transformers_modules/${SCRATCH_KEY}"
     TARGET_MODEL="${SCRATCH}"
 fi
 

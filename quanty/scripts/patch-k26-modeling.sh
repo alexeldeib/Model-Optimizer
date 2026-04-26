@@ -25,16 +25,34 @@ if [[ ! -d "${SRC}" ]]; then
     exit 2
 fi
 
-TARGET="${SRC}/modeling_kimi_k25.py"
-if [[ ! -f "${TARGET}" ]]; then
-    echo "skip: ${TARGET} not present" >&2
-    exit 0
+# Bug 1: MoonViT3dEncoder.__init__ uses ``self.use_deterministic_attn``
+# before assignment.
+KIMI="${SRC}/modeling_kimi_k25.py"
+if [[ -f "${KIMI}" ]]; then
+    if grep -q "use_deterministic_attn=self\.use_deterministic_attn" "${KIMI}"; then
+        sed -i 's/use_deterministic_attn=self\.use_deterministic_attn/use_deterministic_attn=False/g' "${KIMI}"
+        echo "patched: ${KIMI}"
+    else
+        echo "already patched: ${KIMI}"
+    fi
+else
+    echo "skip: ${KIMI} not present" >&2
 fi
 
-# Only mutate when the buggy substring is still present.
-if grep -q "use_deterministic_attn=self\.use_deterministic_attn" "${TARGET}"; then
-    sed -i 's/use_deterministic_attn=self\.use_deterministic_attn/use_deterministic_attn=False/g' "${TARGET}"
-    echo "patched: ${TARGET}"
+# Bug 2: K2.6's ``modeling_deepseek.py`` imports
+# ``is_torch_fx_available`` from ``transformers.utils.import_utils``.
+# That symbol was removed in transformers 5.x (torch.fx is always
+# available in torch 2.x, the gate is gone).  Replace the import with
+# a constant True stub so callsites continue to work without the
+# upstream symbol.
+DEEPSEEK="${SRC}/modeling_deepseek.py"
+if [[ -f "${DEEPSEEK}" ]]; then
+    if grep -q "from transformers.utils.import_utils import is_torch_fx_available" "${DEEPSEEK}"; then
+        sed -i 's|^from transformers\.utils\.import_utils import is_torch_fx_available$|def is_torch_fx_available(): return True  # quanty: transformers 5.x removed this symbol|' "${DEEPSEEK}"
+        echo "patched: ${DEEPSEEK}"
+    else
+        echo "already patched: ${DEEPSEEK}"
+    fi
 else
-    echo "already patched: ${TARGET}"
+    echo "skip: ${DEEPSEEK} not present" >&2
 fi
