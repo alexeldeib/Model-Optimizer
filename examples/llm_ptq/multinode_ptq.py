@@ -369,7 +369,17 @@ def load_and_prepare_model(
     decoder_layers = _find_decoder_layers(model)
     for layer in decoder_layers:
         fully_shard(layer)
-    fully_shard(model)
+    # Intentionally NOT calling ``fully_shard(model)`` for the top-level
+    # wrap.  Top-level fully_shard would wrap ``embed_tokens``,
+    # ``lm_head``, and ``final_layernorm`` as DTensors.  modelopt's
+    # layerwise calibration replays individual ``layer.forward`` calls
+    # rather than the full ``model.forward``, so the top-level FSDP2
+    # pre-forward hook (which would unshard embed_tokens for the
+    # embedding lookup) never fires during replay -- the DTensor weight
+    # leaks into ``aten.embedding``, raising "got mixed torch.Tensor and
+    # DTensor".  Leaving these small (~1.7 GiB for K2.x) modules
+    # replicated across ranks costs negligible memory vs. the per-rank
+    # decoder shard footprint and keeps forward semantics intact.
 
     # No ``model.to_empty(...)`` call: it would clobber non-meta buffers
     # (RoPE inv_freq etc.) that we just moved up, breaking forward.
