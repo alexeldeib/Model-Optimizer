@@ -99,13 +99,14 @@ quantize:
     - quantizer_name: 'output.*'
       enable: false
 
-    # 5) Norms / nonlinearities never quantized.
-    - parent_class: 'nn.LayerNorm'
-      quantizer_name: '*'
-      enable: false
-    - parent_class: 'nn.RMSNorm'
-      quantizer_name: '*'
-      enable: false
-    - parent_class: 'nn.SiLU'
-      quantizer_name: '*'
-      enable: false
+    # Note: norms / nonlinearities are NOT explicitly listed here.
+    # ``parent_class: 'nn.RMSNorm'`` would be the natural selector but
+    # modelopt's set_quantizer_by_cfg validates that any parent_class
+    # string resolves in QuantModuleRegistry (even for ``enable: false``).
+    # nn.RMSNorm has no registered quantized equivalent -> ValueError at
+    # apply_mode (raised on K2.6's first attempt).  The default
+    # ``quantizer_name: '*' enable: false`` at the top of this list
+    # already disables every quantizer; the explicit opt-ins above
+    # (``*mlp.experts.*weight_quantizer`` etc.) don't match norm/silu
+    # modules, so they stay disabled without needing a parent_class
+    # selector.
