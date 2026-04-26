@@ -712,6 +712,16 @@ def _export_transformers_checkpoint(
 
     accelerator = kwargs.get("accelerator")
 
+    import time as _qty_time
+    _qty_t0 = _qty_time.monotonic()
+
+    def _qty_log(msg: str) -> None:
+        if accelerator is None or accelerator.is_main_process:
+            elapsed = _qty_time.monotonic() - _qty_t0
+            print(f"[export +{elapsed:7.2f}s] {msg}", flush=True)
+
+    _qty_log("entered _export_transformers_checkpoint")
+
     # Handle input quantizers of experts that are not calibrated
     for _, sub_module in model.named_modules():
         if is_moe(sub_module) and hasattr(sub_module, "experts"):
@@ -769,9 +779,13 @@ def _export_transformers_checkpoint(
                         f"Please file an issue or add support for this model architecture."
                     )
 
+    _qty_log("expert input-quantizer setup done; entering requantize_resmooth_fused_llm_layers")
+
     # Resmooth and requantize fused layers
     # TODO: Handle mixed precision
     requantize_resmooth_fused_llm_layers(model)
+
+    _qty_log("requantize_resmooth_fused_llm_layers done")
 
     # Remove all hooks from the model
     try:
@@ -781,7 +795,11 @@ def _export_transformers_checkpoint(
     except ImportError:
         warnings.warn("accelerate is not installed, hooks will not be removed")
 
+    _qty_log("hooks removed; entering get_quant_config")
+
     quant_config = get_quant_config(model, is_modelopt_qlora=is_modelopt_qlora)
+
+    _qty_log("get_quant_config done")
 
     # Add MTP layer prefixes to exclude_modules if they were excluded from quantization
     # This ensures they appear in quantization_config["ignore"] in config.json
@@ -807,19 +825,27 @@ def _export_transformers_checkpoint(
             f"Taking element-wise max of amaxes for serving-engine fusion."
         )
 
+    _qty_log("sync_moe_gate_up_amax done; entering _process_quantized_modules")
+
     # Process all quantized modules and export weights
     _process_quantized_modules(model, dtype, is_modelopt_qlora)
+
+    _qty_log("_process_quantized_modules done; entering _reconstruct_fused_moe_linear")
 
     # Reconstruct fused MoELinear: per-expert _QuantLinear weights → original 3D format
     from modelopt.torch.quantization.plugins.huggingface import _reconstruct_fused_moe_linear
 
     _reconstruct_fused_moe_linear(model)
 
+    _qty_log("_reconstruct_fused_moe_linear done; gathering state_dict")
+
     if accelerator is not None:
         # Gather state_dict from all ranks
         quantized_state_dict = accelerator.get_state_dict(model)
     else:
         quantized_state_dict = model.state_dict()
+
+    _qty_log("state_dict gathered; entering postprocess_state_dict")
 
     # We define kv cache scale as amax / 448 for both FP8 and NVFP4 KV cache quantization.
     kv_cache_max_bound = 448
