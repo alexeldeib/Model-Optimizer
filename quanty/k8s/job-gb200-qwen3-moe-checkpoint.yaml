@@ -1,0 +1,139 @@
+---
+# Validate the distributed-checkpoint upstream commit end-to-end.
+#
+# Same Qwen3-30B-A3B target + 4x GB200 setup as
+# job-gb200-qwen3-moe-ptq.yaml, but use the upstream
+# ``nvfp4_default-none_kv_gptq.yaml`` recipe which has both
+# ``layerwise: true`` AND ``layerwise_checkpoint_dir: output/layerwise_ckpts/``,
+# exercising the per-layer save/resume code path.  Rank-0 should be
+# the only writer; all ranks barrier per save; ``_CheckpointState``
+# must not raise at world_size=4 (the bug the upstream commit fixed).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: quanty-gb200-qwen3-moe-checkpoint
+  namespace: ace-inference
+  labels:
+    app: quanty-gb200-qwen3-moe-checkpoint
+    workstream: e2e-validation-checkpoint
+    owner: aeldeib
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels:
+        app: quanty-gb200-qwen3-moe-checkpoint
+        owner: aeldeib
+    spec:
+      restartPolicy: OnFailure
+      schedulerName: binpack-scheduler
+      priorityClassName: inference-partial-node
+      imagePullSecrets:
+        - name: inference-backends-image-pull-secret
+      nodeSelector:
+        node.coreweave.cloud/type: gb200-4x-l
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      volumes:
+        - name: ckpt
+          persistentVolumeClaim:
+            claimName: k26-nvfp4-ckpt
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 128Gi
+      containers:
+        - name: ptq
+          image: docker.cloudsmith.io/coreweave/infr-dev/quanty-modelopt:dev
+          imagePullPolicy: Always
+          workingDir: /work
+          env:
+            - name: NCCL_DEBUG
+              value: "WARN"
+            - name: NCCL_ASYNC_ERROR_HANDLING
+              value: "1"
+            - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+              value: "1"
+            - name: HF_HOME
+              value: /work/hf-cache
+            - name: TRANSFORMERS_CACHE
+              value: /work/hf-cache
+            - name: HF_HUB_ENABLE_HF_TRANSFER
+              value: "1"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: k26-hf-secret
+                  key: HF_TOKEN
+                  optional: true
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NUM_GPUS
+              value: "4"
+            - name: TARGET_MODEL
+              value: Qwen/Qwen3-30B-A3B
+            - name: RECIPE
+              # GPTQ recipe with ``layerwise_checkpoint_dir`` set so the
+              # distributed-checkpoint upstream commit's code path runs.
+              value: /opt/quanty/modelopt_recipes/general/ptq/nvfp4_default-none_kv_gptq.yaml
+            - name: CHECKPOINT_DIR
+              value: /work/quanty/checkpoints/qwen3-moe-gptq-layerwise
+            - name: EXPORT_DIR
+              value: /work/quanty/exports/qwen3-moe-gptq-layerwise
+            - name: CALIB_DATASET
+              value: cnn_dailymail
+            - name: CALIB_SAMPLES
+              value: "64"
+            - name: CALIB_BATCH
+              value: "2"
+          resources:
+            limits:
+              nvidia.com/gpu: 4
+              memory: 700Gi
+              cpu: 64
+            requests:
+              nvidia.com/gpu: 4
+              memory: 600Gi
+              cpu: 48
+          volumeMounts:
+            - name: ckpt
+              mountPath: /work
+            - name: shm
+              mountPath: /dev/shm
+          command:
+            - /usr/bin/tini
+            - --
+            - bash
+            - -lc
+            - |
+              set -o pipefail
+              cd /opt/quanty
+              LOG="${EXPORT_DIR}/run.log"
+              mkdir -p "${CHECKPOINT_DIR}" "${EXPORT_DIR}"
+              # Override the recipe's relative ``layerwise_checkpoint_dir``
+              # with our shared-FS dir.  The recipe yaml sets
+              # ``layerwise_checkpoint_dir: output/layerwise_ckpts/``;
+              # cwd is /opt/quanty so that resolves to
+              # /opt/quanty/output/layerwise_ckpts which is local-FS.
+              # We want the shared-FS path, so symlink before launch.
+              mkdir -p output
+              ln -sfn "${CHECKPOINT_DIR}" output/layerwise_ckpts
+              torchrun \
+                  --nproc-per-node="${NUM_GPUS}" \
+                  --rdzv-backend=c10d \
+                  --rdzv-endpoint=localhost:0 \
+                  examples/llm_ptq/multinode_ptq.py \
+                  --pyt_ckpt_path "${TARGET_MODEL}" \
+                  --recipe "${RECIPE}" \
+                  --calib_size "${CALIB_SAMPLES}" \
+                  --batch_size "${CALIB_BATCH}" \
+                  --dataset "${CALIB_DATASET}" \
+                  --export_path "${EXPORT_DIR}" \
+                  2>&1 | tee "${LOG}"
