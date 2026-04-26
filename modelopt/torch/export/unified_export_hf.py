@@ -315,22 +315,10 @@ def _fuse_shared_input_modules(
 
 def requantize_resmooth_fused_llm_layers(model: torch.nn.Module):
     """Group modules that take the same input and register shared parameters in module."""
-    import time as _qty_t
-    _qty_rs0 = _qty_t.monotonic()
-    def _qty_rs(msg):
-        try:
-            import torch.distributed as _qty_d
-            if _qty_d.is_initialized() and _qty_d.get_rank() != 0:
-                return
-        except Exception:
-            pass
-        print(f"[rs +{_qty_t.monotonic()-_qty_rs0:7.2f}s] {msg}", flush=True)
-    _qty_rs("entered requantize_resmooth_fused_llm_layers")
     # TODO: Handle DBRX MoE
     quantization_format = get_quantization_format(model)
     model_type = type(model).__name__.lower()
     module_names = set()
-    _qty_rs(f"qfmt={quantization_format} model_type={model_type}")
 
     # NVFP4 SVDQuant does not need pre-quant scale fusion (either into previous linear or layernorm) because
     # 1) its kernel handles pre-quant scale.
@@ -399,11 +387,9 @@ def requantize_resmooth_fused_llm_layers(model: torch.nn.Module):
         else:
             model(fake_input)
 
-    _qty_rs("calling collect_shared_input_modules (runs dummy forward)")
     input_to_linear, output_to_layernorm = collect_shared_input_modules(
         model, llm_dummy_forward, collect_layernorms=True
     )
-    _qty_rs(f"collect_shared_input_modules done; input_to_linear={len(input_to_linear)} output_to_layernorm={len(output_to_layernorm)}")
 
     fused_linears = _fuse_shared_input_modules(
         model,
@@ -413,11 +399,9 @@ def requantize_resmooth_fused_llm_layers(model: torch.nn.Module):
         fuse_layernorms=True,
         quantization_format=quantization_format,
     )
-    _qty_rs(f"_fuse_shared_input_modules done; fused_linears={len(fused_linears)}")
 
     # The dummy forward may not be able to activate all the experts.
     # Process experts by naming rules like experts.0, experts.1, etc.
-    _expert_loop_calls = 0
     for name, modules_fused in fused_linears.items():
         if re.search(r"experts?\.\d+", name):
             expert_id = 0
@@ -438,11 +422,7 @@ def requantize_resmooth_fused_llm_layers(model: torch.nn.Module):
                 with fsdp2_aware_weight_update(model, new_expert_modules):
                     preprocess_linear_fusion(new_expert_modules)
 
-                _expert_loop_calls += 1
-                if _expert_loop_calls % 100 == 0:
-                    _qty_rs(f"expert-loop call {_expert_loop_calls}")
                 expert_id += 1
-    _qty_rs(f"expert-loop done; total fsdp2_aware calls={_expert_loop_calls}")
 
 
 def _export_quantized_weight(
@@ -732,21 +712,11 @@ def _export_transformers_checkpoint(
 
     accelerator = kwargs.get("accelerator")
 
-    import time as _qty_time
-    _qty_t0 = _qty_time.monotonic()
-
-    def _qty_log(msg: str) -> None:
-        if accelerator is None or accelerator.is_main_process:
-            elapsed = _qty_time.monotonic() - _qty_t0
-            print(f"[export +{elapsed:7.2f}s] {msg}", flush=True)
-
-    _qty_log("entered _export_transformers_checkpoint")
-
     # Build the named_modules / id_to_name index ONCE for the duration
     # of the export.  Every call into ``fsdp2_aware_weight_update``
     # below (per quantized linear) would otherwise rebuild that
-    # ~56,000-entry dict (~50 ms each on Qwen3-MoE), turning the export
-    # into a 2-hour O(N * n_modules) walk.  ``fsdp_module_index_cache``
+    # dict (O(n_modules)), turning the export into an O(N * n_modules)
+    # walk that takes hours on MoE models.  ``fsdp_module_index_cache``
     # stashes the index on ``model`` and ``fsdp2_aware_weight_update``
     # picks it up via ``_FSDP_INDEX_CACHE_ATTR``.
     from modelopt.torch.quantization.utils.core_utils import fsdp_module_index_cache
@@ -811,13 +781,9 @@ def _export_transformers_checkpoint(
                         f"Please file an issue or add support for this model architecture."
                     )
 
-    _qty_log("expert input-quantizer setup done; entering requantize_resmooth_fused_llm_layers")
-
     # Resmooth and requantize fused layers
     # TODO: Handle mixed precision
     requantize_resmooth_fused_llm_layers(model)
-
-    _qty_log("requantize_resmooth_fused_llm_layers done")
 
     # Remove all hooks from the model
     try:
@@ -827,11 +793,7 @@ def _export_transformers_checkpoint(
     except ImportError:
         warnings.warn("accelerate is not installed, hooks will not be removed")
 
-    _qty_log("hooks removed; entering get_quant_config")
-
     quant_config = get_quant_config(model, is_modelopt_qlora=is_modelopt_qlora)
-
-    _qty_log("get_quant_config done")
 
     # Add MTP layer prefixes to exclude_modules if they were excluded from quantization
     # This ensures they appear in quantization_config["ignore"] in config.json
@@ -857,27 +819,19 @@ def _export_transformers_checkpoint(
             f"Taking element-wise max of amaxes for serving-engine fusion."
         )
 
-    _qty_log("sync_moe_gate_up_amax done; entering _process_quantized_modules")
-
     # Process all quantized modules and export weights
     _process_quantized_modules(model, dtype, is_modelopt_qlora)
-
-    _qty_log("_process_quantized_modules done; entering _reconstruct_fused_moe_linear")
 
     # Reconstruct fused MoELinear: per-expert _QuantLinear weights → original 3D format
     from modelopt.torch.quantization.plugins.huggingface import _reconstruct_fused_moe_linear
 
     _reconstruct_fused_moe_linear(model)
 
-    _qty_log("_reconstruct_fused_moe_linear done; gathering state_dict")
-
     if accelerator is not None:
         # Gather state_dict from all ranks
         quantized_state_dict = accelerator.get_state_dict(model)
     else:
         quantized_state_dict = model.state_dict()
-
-    _qty_log("state_dict gathered; entering postprocess_state_dict")
 
     # Release the cached named_modules() index.
     _index_cache_ctx.__exit__(None, None, None)
