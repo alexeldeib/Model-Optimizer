@@ -833,6 +833,38 @@ def disable_calib(quantizer):
         quantizer._if_calib = original_if_calib
 
 
+_FSDP_INDEX_CACHE_ATTR = "_modelopt_fsdp_index_cache"
+
+
+@contextmanager
+def fsdp_module_index_cache(root_model: nn.Module):
+    """Cache ``root_model.named_modules()`` for the duration of the export.
+
+    PTQ export wraps every quantized linear in
+    :func:`fsdp2_aware_weight_update`.  Without this cache, each call
+    rebuilds ``dict(root_model.named_modules())`` (O(n_modules)) and
+    its inverse id-keyed mapping; for an MoE export over N quantized
+    linears the dict-construction term alone is O(N * n_modules).
+    Wrapping the export in this context manager moves that cost to
+    O(n_modules) total.
+
+    Pairs with the optional ``name_to_module`` / ``id_to_name``
+    parameters in :func:`_get_module_name`,
+    :func:`_get_enclosing_fsdp_module`, and
+    :func:`create_fsdp_param_mapping`: when a cached index is set on
+    ``root_model``, :func:`fsdp2_aware_weight_update` reuses it
+    instead of rebuilding.
+    """
+    name_to_module = dict(root_model.named_modules())
+    id_to_name = {id(m): n for n, m in name_to_module.items()}
+    setattr(root_model, _FSDP_INDEX_CACHE_ATTR, (name_to_module, id_to_name))
+    try:
+        yield
+    finally:
+        if hasattr(root_model, _FSDP_INDEX_CACHE_ATTR):
+            delattr(root_model, _FSDP_INDEX_CACHE_ATTR)
+
+
 @contextmanager
 def fsdp2_aware_weight_update(root_model, modules_to_update, reshard=True):
     """Context manager to update the FSDPParam list if an update is made to a submodule of an FSDPModule.
@@ -860,14 +892,21 @@ def fsdp2_aware_weight_update(root_model, modules_to_update, reshard=True):
             if not isinstance(modules_to_update, list):
                 modules_to_update = [modules_to_update]
 
-            # Build the module index once per call.  Both the module->root
-            # walk below and the per-parameter loop in the finally block
-            # need module-name lookups; without the inverse id map, each
-            # lookup would be O(n_modules).  For PTQ export the caller
-            # invokes this context manager once per quantized linear --
-            # ~18,000 for Qwen3-MoE, ~256,000 for K2.6 -- so even a
-            # single O(n) scan per call lifts the export to O(n^2).
-            name_to_module, id_to_name = _build_module_index(root_model)
+            # Build the module index once per call -- or reuse one set by
+            # ``fsdp_module_index_cache`` for the duration of the export.
+            # Both the module->root walk below and the per-parameter loop
+            # in the finally block need module-name lookups; without the
+            # inverse id map, each lookup would be O(n_modules).  For PTQ
+            # export the caller invokes this context manager once per
+            # quantized linear -- tens of thousands of times -- so even a
+            # single O(n) scan per call lifts the export to O(n^2), and
+            # building the dict per call (~50ms for Qwen3-MoE) dominates
+            # over the actual update work.
+            cached = getattr(root_model, _FSDP_INDEX_CACHE_ATTR, None)
+            if cached is not None:
+                name_to_module, id_to_name = cached
+            else:
+                name_to_module, id_to_name = _build_module_index(root_model)
 
             root_modules = set()
             for module in modules_to_update:
