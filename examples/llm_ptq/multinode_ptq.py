@@ -25,13 +25,16 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import safetensors
 import torch
 import torch.nn as nn
-from accelerate import Accelerator
+from accelerate import Accelerator, init_empty_weights
 from example_utils import build_quant_cfg, get_tokenizer
 from modelopt.recipe import ModelOptPTQRecipe, load_recipe
+from torch.distributed.fsdp import fully_shard
+from torch.distributed.tensor import DTensor, distribute_tensor
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, PreTrainedTokenizer, PreTrainedTokenizerFast
+from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedTokenizer, PreTrainedTokenizerFast
 
 import modelopt.torch.opt as mto
 import modelopt.torch.quantization as mtq
@@ -40,7 +43,7 @@ from modelopt.torch.export.convert_hf_config import convert_hf_quant_config_form
 from modelopt.torch.export.unified_export_hf import _export_transformers_checkpoint
 from modelopt.torch.quantization.config import need_calibration
 from modelopt.torch.quantization.plugins.huggingface import patch_compressed_linear_loading
-from modelopt.torch.quantization.utils import no_requires_grad, patch_fsdp_mp_dtypes
+from modelopt.torch.quantization.utils import patch_fsdp_mp_dtypes
 from modelopt.torch.utils.dataset_utils import get_dataset_dataloader, get_supported_datasets
 
 # Constants
@@ -141,27 +144,172 @@ def parse_args():
     return args
 
 
+def _find_decoder_layers(model: nn.Module) -> list[nn.Module]:
+    """Locate the homogeneous decoder layers for FSDP2 wrap.
+
+    Walks past common multimodal containers (``language_model`` /
+    ``text_model``) so VLM checkpoints like Kimi-K2.x's
+    ``KimiK25ForConditionalGeneration -> DeepseekV3ForCausalLM`` resolve
+    to their LLM core.  This mirrors the ``feat/vlm-decoder-discovery``
+    upstream commit's dispatcher policy.
+    """
+    cursors = [model]
+    for attr in ("language_model", "text_model"):
+        if hasattr(cursors[-1], attr):
+            cursors.append(getattr(cursors[-1], attr))
+    for cursor in reversed(cursors):
+        if hasattr(cursor, "model") and hasattr(cursor.model, "layers"):
+            return list(cursor.model.layers)
+        if hasattr(cursor, "layers"):
+            return list(cursor.layers)
+    raise ValueError("Could not locate decoder layers for FSDP2 wrap")
+
+
+def _load_sharded_weights_from_safetensors(
+    model: nn.Module,
+    model_path: str,
+    accelerator: Accelerator,
+) -> None:
+    """Per-rank sharded read from HF safetensors into FSDP2-wrapped model.
+
+    Each rank reads each tensor on demand and uses ``distribute_tensor`` to
+    slice it into its FSDP2 shard placement, then frees the full copy.
+    Peak memory per rank is one tensor at a time -- never the full model
+    on any rank.
+
+    Required because for trillion-parameter MoE models like Kimi K2.x
+    (~2 TB BF16) the standard HF ``from_pretrained`` materializes the
+    full model on every pod's HBM (or every rank-0 CPU with
+    ``cpu_ram_efficient_loading=True``), exceeding both the per-pod
+    HBM (4 GPUs * 184 GiB = 736 GiB) and the per-node CPU RAM (~1 TB).
+
+    Args:
+        model: Model with structure already set up (e.g. via
+            ``init_empty_weights`` + ``from_config``) and FSDP2-wrapped
+            via ``fully_shard``.  Parameters should be DTensors on real
+            (non-meta) device storage; call ``model.to_empty(device=...)``
+            before this function.
+        model_path: Directory containing ``*.safetensors`` shards and
+            either ``model.safetensors.index.json`` (sharded) or a single
+            ``model.safetensors`` file.
+        accelerator: Accelerator instance for rank/device info.
+    """
+    device = accelerator.device
+    model_dir = Path(model_path)
+
+    index_file = model_dir / "model.safetensors.index.json"
+    if index_file.exists():
+        with open(index_file) as fh:
+            weight_map: dict[str, str] = json.load(fh)["weight_map"]
+    else:
+        single = model_dir / "model.safetensors"
+        if not single.exists():
+            raise FileNotFoundError(
+                f"No safetensors checkpoint at {model_dir} "
+                "(expected model.safetensors.index.json or model.safetensors)"
+            )
+        with safetensors.safe_open(str(single), framework="pt", device="cpu") as fh:
+            weight_map = {k: "model.safetensors" for k in fh.keys()}
+
+    tensors_by_shard: dict[str, list[str]] = {}
+    for tname, shard in weight_map.items():
+        tensors_by_shard.setdefault(shard, []).append(tname)
+
+    name_to_target: dict[str, tuple[torch.Tensor, str]] = {
+        n: (p, "param") for n, p in model.named_parameters()
+    }
+    for n, b in model.named_buffers():
+        name_to_target.setdefault(n, (b, "buffer"))
+
+    n_shards = len(tensors_by_shard)
+    if accelerator.is_main_process:
+        print(
+            f"Sharded load: {n_shards} safetensors files, "
+            f"world_size={accelerator.num_processes}"
+        )
+
+    n_loaded = 0
+    n_skipped = 0
+    for i, shard_file in enumerate(sorted(tensors_by_shard.keys())):
+        shard_path = str(model_dir / shard_file)
+        with safetensors.safe_open(shard_path, framework="pt", device="cpu") as fh:
+            for tname in tensors_by_shard[shard_file]:
+                target = name_to_target.get(tname)
+                if target is None:
+                    n_skipped += 1
+                    continue
+                tensor, kind = target
+                full = fh.get_tensor(tname).to(device, dtype=tensor.dtype, non_blocking=True)
+                if isinstance(tensor, DTensor):
+                    distributed = distribute_tensor(
+                        full, tensor.device_mesh, tensor.placements
+                    )
+                    with torch.no_grad():
+                        tensor.copy_(distributed)
+                    del distributed
+                elif kind == "param":
+                    with torch.no_grad():
+                        tensor.data.copy_(full)
+                else:
+                    with torch.no_grad():
+                        tensor.copy_(full)
+                del full
+                n_loaded += 1
+        if accelerator.is_main_process and ((i + 1) % 8 == 0 or (i + 1) == n_shards):
+            print(f"  shard {i + 1}/{n_shards}: {shard_file}")
+
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        print(f"Sharded load complete: {n_loaded} tensors loaded, {n_skipped} skipped")
+
+
 def load_and_prepare_model(
     model_path: str,
     calib_dataloader: torch.utils.data.DataLoader,
     accelerator: Accelerator,
     trust_remote_code: bool = False,
 ) -> tuple[nn.Module, str, list[str], torch.utils.data.DataLoader]:
-    """Load model and prepare it for FSDP2 distributed execution.
+    """Load model with meta-init + per-rank sharded load + FSDP2 wrap.
+
+    Avoids any rank materializing the full model.  Sequence:
+      1. ``init_empty_weights`` + ``from_config``: structure on meta tensors
+         (no real storage anywhere).
+      2. ``fully_shard`` per decoder layer + top-level: FSDP2 wraps the
+         meta tensors into DTensors with sharded placements.
+      3. ``model.to_empty(device=...)``: allocates real (uninitialized)
+         storage on each rank's HBM for its FSDP2 shards only.
+      4. ``_load_sharded_weights_from_safetensors``: each rank reads each
+         tensor from the safetensors shards and ``distribute_tensor``
+         slices it into the rank's local DTensor shard; the full copy
+         is released immediately.
+
+    The standard ``from_pretrained`` path puts the full model on each
+    pod's HBM before FSDP2 has a chance to shard cross-node, which
+    OOMs at trillion-parameter scale (e.g. Kimi K2.x BF16 = ~2 TB
+    >> 4 * 184 GiB per-pod HBM).  ``cpu_ram_efficient_loading=True``
+    helps for models that fit in rank-0's CPU RAM but is also
+    inadequate at K2.x scale (~1 TB CPU per node).
 
     Args:
-        model_path: Path to the HuggingFace model
-        calibration_dataloader: Calibration dataloader to be sharded for calibration
-        accelerator: Accelerate's Accelerator instance
-        trust_remote_code: Whether to trust remote code
+        model_path: HF safetensors directory.
+        calib_dataloader: Calibration dataloader to shard for calibration.
+        accelerator: Accelerate's Accelerator instance.
+        trust_remote_code: Whether to trust remote code.
 
     Returns:
-        Tuple of (prepared_model, model_type, original_architectures, calibration_dataloader)
+        Tuple of (prepared_model, model_type, original_architectures,
+        calibration_dataloader).
     """
-    with patch_compressed_linear_loading():
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path, dtype="auto", trust_remote_code=trust_remote_code
-        )
+    if accelerator.is_main_process:
+        print(f"Meta-initializing model from {model_path}...")
+
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
+    with init_empty_weights():
+        with patch_compressed_linear_loading():
+            model = AutoModelForCausalLM.from_config(
+                config, trust_remote_code=trust_remote_code, dtype="auto"
+            )
+
     model.eval()
     model.requires_grad_(False)
     # Disable KV cache during calibration: layerwise_calibrate replays
@@ -177,21 +325,27 @@ def load_and_prepare_model(
     # conservative correct fix.
     if hasattr(model, "config") and hasattr(model.config, "use_cache"):
         model.config.use_cache = False
+
     model_type = get_model_type(model)
-    # Need the original architectures for export
-    # FSDP prefix is added to the architectures for FSDP2 wrapped models
     original_architectures = model.config.architectures
 
-    # FSDP2 requires an optimizer to be prepared together with the model
-    dummy_optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
     if accelerator.is_main_process:
-        print("Preparing model with FSDP2...")
-    with no_requires_grad():
-        model, _, calibration_dataloader = accelerator.prepare(
-            model, dummy_optimizer, calib_dataloader
-        )
+        print("Applying FSDP2 fully_shard per decoder layer...")
+    decoder_layers = _find_decoder_layers(model)
+    for layer in decoder_layers:
+        fully_shard(layer)
+    fully_shard(model)
+
+    # Allocate real (uninitialized) storage for each rank's FSDP2 shard.
+    # Without this, ``param._local_tensor`` remains on the meta device
+    # and copy_ into it is a no-op.
     if accelerator.is_main_process:
-        print("FSDP2 prepare completed.")
+        print(f"Allocating per-rank shard storage on {accelerator.device}...")
+    model.to_empty(device=accelerator.device)
+
+    _load_sharded_weights_from_safetensors(model, model_path, accelerator)
+
+    calibration_dataloader = accelerator.prepare(calib_dataloader)
 
     return model, model_type, original_architectures, calibration_dataloader
 
