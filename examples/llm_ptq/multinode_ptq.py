@@ -559,6 +559,7 @@ def main(args):
     fsdp_plugin = FullyShardedDataParallelPlugin(
         fsdp_version=2,
         sharding_strategy="FULL_SHARD",
+        reshard_after_forward=True,  # FSDP2 requires explicit bool
         state_dict_type="FULL_STATE_DICT",
         cpu_offload=False,
         sync_module_states=False,
