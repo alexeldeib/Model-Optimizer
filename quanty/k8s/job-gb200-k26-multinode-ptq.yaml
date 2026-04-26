@@ -1,0 +1,189 @@
+---
+# K2.6 NVFP4 multinode PTQ on 4x GB200 nodes (16 GPUs, ~3 TB HBM total).
+#
+# This is the v2 of job-gb200-k26-ptq-fast.yaml: same launcher target,
+# same recipe, same source PVC, but spread across 4 nodes via FSDP2 +
+# torchrun multi-node rendezvous.  The single-node v1 OOMs at FSDP2
+# wrap because it tries to materialize the 1.04T-param model on a
+# single rank momentarily; spreading the unshard step over 16 GPUs
+# fits comfortably (each rank's peak is ~ model_size / world_size +
+# layerwise overhead, which is well under 184 GiB / rank).
+#
+# Topology:
+#   * Indexed Job, parallelism=completions=4 -> pods 0..3
+#   * Each pod gets 4x GB200 GPUs (16 GPUs total)
+#   * Pod-0 is torchrun rendezvous master, reachable via the headless
+#     service DNS as quanty-gb200-k26-mn-ptq-0.<svc>:29500
+#   * Layerwise checkpoint dir on shared PVC means a preempted pod
+#     resumes from the last fully-written layer without redoing the
+#     ~2 hours of GPTQ Hessian collection per layer.
+#
+# Headless service must allow not-ready addresses so workers can
+# resolve the master before any pod transitions to Ready.
+apiVersion: v1
+kind: Service
+metadata:
+  name: quanty-gb200-k26-mn-rdzv
+  namespace: ace-inference
+  labels:
+    app: quanty-gb200-k26-mn-ptq
+    workstream: phase3-k26-ptq-multinode
+    owner: aeldeib
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: quanty-gb200-k26-mn-ptq
+  ports:
+    - name: rdzv
+      port: 29500
+      targetPort: 29500
+      protocol: TCP
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: quanty-gb200-k26-mn-ptq
+  namespace: ace-inference
+  labels:
+    app: quanty-gb200-k26-mn-ptq
+    workstream: phase3-k26-ptq-multinode
+    owner: aeldeib
+spec:
+  # Indexed completions assign each pod a unique JOB_COMPLETION_INDEX
+  # (0..parallelism-1).  k8s 1.27+ also auto-sets hostname to
+  # <job-name>-<index>, so workers reach pod-0 via DNS without an
+  # init-container peek.
+  parallelism: 4
+  completions: 4
+  completionMode: Indexed
+  # 8 = ~2 retries per pod.  The layerwise checkpoint resume picks up
+  # from the last fully-written layer so a single-node failure costs
+  # only the in-flight layer's GPTQ work.
+  backoffLimit: 8
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels:
+        app: quanty-gb200-k26-mn-ptq
+        owner: aeldeib
+    spec:
+      restartPolicy: OnFailure
+      schedulerName: binpack-scheduler
+      priorityClassName: inference-partial-node
+      # Subdomain wires pod hostnames into the headless service DNS:
+      # quanty-gb200-k26-mn-ptq-<index>.quanty-gb200-k26-mn-rdzv.<ns>.svc...
+      subdomain: quanty-gb200-k26-mn-rdzv
+      imagePullSecrets:
+        - name: inference-backends-image-pull-secret
+      nodeSelector:
+        node.coreweave.cloud/type: gb200-4x-l
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      volumes:
+        - name: bf16-source
+          persistentVolumeClaim:
+            claimName: k26-source-bf16
+            readOnly: true
+        - name: nvfp4-ckpt
+          persistentVolumeClaim:
+            claimName: k26-nvfp4-ckpt
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 256Gi
+      containers:
+        - name: ptq
+          image: docker.cloudsmith.io/coreweave/infr-dev/quanty-modelopt:dev
+          imagePullPolicy: Always
+          workingDir: /work
+          env:
+            - name: NCCL_DEBUG
+              value: "WARN"
+            - name: NCCL_ASYNC_ERROR_HANDLING
+              value: "1"
+            - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+              value: "1"
+            # Inter-node NCCL needs to bind to the right interface --
+            # eth0 is the cluster-routable iface on these nodes per the
+            # c2-k25 deployments' precedent.
+            - name: NCCL_SOCKET_IFNAME
+              value: "eth0"
+            # IB / NVLS opportunistic enables; harmless if unavailable.
+            - name: NCCL_NVLS_ENABLE
+              value: "1"
+            - name: NCCL_IB_DISABLE
+              value: "0"
+            - name: HF_HOME
+              value: /work/hf-cache
+            - name: TRANSFORMERS_CACHE
+              value: /work/hf-cache
+            - name: HF_HUB_ENABLE_HF_TRANSFER
+              value: "1"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: k26-hf-secret
+                  key: HF_TOKEN
+                  optional: true
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # ---- multinode topology ----
+            - name: NUM_GPUS
+              value: "4"
+            - name: NNODES
+              value: "4"
+            - name: MASTER_ADDR
+              value: "quanty-gb200-k26-mn-ptq-0.quanty-gb200-k26-mn-rdzv.ace-inference.svc.cluster.local"
+            - name: MASTER_PORT
+              value: "29500"
+            # k8s injects JOB_COMPLETION_INDEX automatically for
+            # Indexed Jobs; the launcher reads it as the node rank.
+            # ---- ptq config ----
+            - name: TARGET_MODEL
+              value: /source/k26-bf16/Kimi-K2.6-BF16
+            - name: RECIPE
+              value: /opt/quanty/quanty/recipes/k26-nvfp4_experts_only-fp8_kv.yaml
+            - name: CHECKPOINT_DIR
+              value: /work/quanty/checkpoints/k26-nvfp4-mn
+            - name: EXPORT_DIR
+              value: /work/quanty/exports/k26-nvfp4-mn
+            - name: CALIB_DATASET
+              value: nemotron-post-training-dataset-v2
+            - name: CALIB_SAMPLES
+              value: "2048"
+            - name: CALIB_BATCH
+              value: "8"
+            - name: CALIB_SEQ_LEN
+              value: "2048"
+          resources:
+            limits:
+              nvidia.com/gpu: 4
+              memory: 700Gi
+              cpu: 64
+            requests:
+              nvidia.com/gpu: 4
+              memory: 600Gi
+              cpu: 48
+          ports:
+            - name: rdzv
+              containerPort: 29500
+              protocol: TCP
+          volumeMounts:
+            - name: bf16-source
+              mountPath: /source/k26-bf16
+              readOnly: true
+            - name: nvfp4-ckpt
+              mountPath: /work
+            - name: shm
+              mountPath: /dev/shm
+          command:
+            - /usr/bin/tini
+            - --
+            - /opt/quanty/quanty/scripts/run-k26-ptq-multinode.sh
