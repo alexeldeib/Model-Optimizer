@@ -2,7 +2,7 @@
 #
 # quanty / modelopt dev image
 # Built via depot, pushed to docker.cloudsmith.io/coreweave/infr-dev/quanty-modelopt:<tag>
-# Run on ace-inference namespace in CW4637-DEV-USE01A
+# Run on ace-inference namespace in cw4637-dev-us-e-01a
 #
 # Targets:
 #   * RTX Pro 6000 (SM120) for FSDP2/layerwise plumbing tests + dense NVFP4
@@ -12,8 +12,13 @@
 #   :dev          -> mainline of feat/quanty/fast-multinode-layerwise-ptq
 #   :sha-<short>  -> immutable per-commit
 #   :pr-<n>       -> PR builds
+#
+# Base: TRT-LLM 1.2.0 (the team's known-working stack for K2.6).  Ships
+# matched torch + flash_attn + transformer_engine + transformers 5.x;
+# avoids the C-ABI mismatches that show up when you upgrade torch on
+# top of the NGC PyTorch base.
 
-ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:25.04-py3
+ARG BASE_IMAGE=nvcr.io/nvidia/tensorrt-llm/release:1.2.0
 FROM ${BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -26,56 +31,57 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TRANSFORMERS_CACHE=/work/hf-cache \
     HF_HUB_ENABLE_HF_TRANSFER=1
 
-# OS deps: git for editable installs, tini as PID-1, jq for json wrangling in launchers,
-# unzip for downloading kernel wheels, openssh-client for git+ssh model fetches.
+# OS deps: git for editable installs, tini as PID-1, jq for json
+# wrangling in launchers, openssh-client for git+ssh fetches.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-        git tini jq unzip openssh-client ca-certificates \
+        git tini jq openssh-client ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/quanty
 
-# Install modelopt + recipes editable so the image picks up branch changes
-# at build time without re-baking the wheel on every iteration.
+# Install modelopt + recipes editable so the image picks up branch
+# changes at build time without re-baking the wheel on every iteration.
 COPY pyproject.toml noxfile.py uv.lock ./
 COPY modelopt/ ./modelopt/
 COPY modelopt_recipes/ ./modelopt_recipes/
 COPY examples/ ./examples/
 COPY tests/ ./tests/
 
-# transformers 5.x for K2.6 / DeepseekV3 / Qwen3-MoE modeling code;
-# accelerate 1.6+ for FSDP2 layerwise composition.  Other deps under
-# ``modelopt[hf,torch]`` are left to modelopt's pyproject to resolve.
+# TRT-LLM 1.2.0 ships transformers 5.x, accelerate 1.x, datasets,
+# flash_attn matched to its bundled torch, etc.  We only add the
+# small set of extras the discovery harness post-processor needs
+# (jsonlines / lm-eval / pyyaml / hf_transfer) and modelopt itself.
 #
-# The NGC PyTorch image ships a global ``PIP_CONSTRAINT`` file that pins
-# every base-image package (e.g. ``dill==0.3.9``, ``pyarrow==19.0.1``).
-# Those pins fight modern ``datasets`` (which wants ``dill<0.3.9``).
-# We disable the constraint file for this layer only; everything else
-# in the image keeps the base-image pins.
-#
-# FlashInfer / vLLM are intentionally NOT installed: PTQ does not import
-# them, and serving images install matched versions themselves.
-RUN PIP_CONSTRAINT= pip install --upgrade pip wheel setuptools \
- && PIP_CONSTRAINT= pip install --upgrade \
-        "transformers>=5.0.0" \
-        "accelerate>=1.6.0" \
-        "datasets>=3.0.0,<4" \
-        "torchvision" \
- && PIP_CONSTRAINT= pip install \
+# Critically we do NOT upgrade torch / torchvision / flash_attn here:
+# the C extensions ship matched against the bundled torch ABI in the
+# TRT-LLM base, and any pip --upgrade of torch silently breaks them.
+RUN pip install --upgrade pip wheel setuptools \
+ && pip install \
         "compressed_tensors>=0.13.0" \
         "hf_transfer>=0.1.6" \
-        "numpy<2.0" \
-        "pyyaml>=6.0" \
         "jsonlines>=4.0.0" \
         "lm-eval>=0.4.5" \
- && PIP_CONSTRAINT= pip install -e ".[hf,torch]"
+        "pyyaml>=6.0" \
+ && pip install -e ".[hf,torch]"
 
 # Sanity probes: a busted install must fail the build, not the cluster job.
-RUN python -c "import modelopt; import modelopt.torch.quantization as mtq; \
-print('modelopt', getattr(modelopt, '__version__', 'editable')); \
-import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda); \
-import transformers; print('transformers', transformers.__version__); \
-import accelerate; print('accelerate', accelerate.__version__)"
+RUN python <<'PY'
+import modelopt
+import modelopt.torch.quantization as mtq  # noqa: F401
+print('modelopt', getattr(modelopt, '__version__', 'editable'))
+import torch
+print('torch', torch.__version__, 'cuda', torch.version.cuda)
+import transformers
+print('transformers', transformers.__version__)
+import accelerate
+print('accelerate', accelerate.__version__)
+try:
+    import flash_attn
+    print('flash_attn', flash_attn.__version__)
+except Exception as e:
+    print('flash_attn ImportError:', e)
+PY
 
 # Quanty-specific harnesses + recipe overlays.
 COPY quanty/scripts/ /opt/quanty/quanty/scripts/
@@ -85,8 +91,8 @@ COPY quanty/recipes/ /opt/quanty/quanty/recipes/
 # the +x bit on copy).
 RUN chmod +x /opt/quanty/quanty/scripts/*.sh /opt/quanty/quanty/scripts/*.py 2>/dev/null || true
 
-# NGC base image already owns UID 1000 (ubuntu user); we run as root in
-# the container.  k8s `securityContext.runAsNonRoot` / `runAsUser` is the
+# Base image already owns its default uid; we run as root in the
+# container.  k8s `securityContext.runAsNonRoot` / `runAsUser` is the
 # correct place to enforce non-root in production deployments.
 WORKDIR /work
 
