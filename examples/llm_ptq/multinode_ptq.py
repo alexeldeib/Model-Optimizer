@@ -492,51 +492,78 @@ def export_model(
     export_dir = Path(export_path)
     export_dir.mkdir(parents=True, exist_ok=True)
 
-    # Patch ``_get_module_name`` and ``_get_enclosing_fsdp_module`` to
-    # cache the ``root_model.named_modules()`` dict.  The base
-    # implementation rebuilds the dict on every call:
+    # Replace ``_get_module_name`` and ``_get_enclosing_fsdp_module``
+    # with O(1) versions that look up the module by id().  The base
+    # implementations are doubly O(n_modules) per call:
     #
     #     def _get_module_name(module, root_model, name_to_module=None):
     #         if name_to_module is None:
     #             name_to_module = dict(root_model.named_modules())   # O(n)
-    #         target_module_name = next((name for name, m in name_to_module.items() if m is module), None)
+    #         target_module_name = next(                                # O(n)
+    #             (name for name, m in name_to_module.items() if m is module),
+    #             None,
+    #         )
     #         return target_module_name
     #
     # ``_process_quantized_modules`` calls ``fsdp2_aware_weight_update``
     # per quantized linear (~18,000 for Qwen3-MoE, ~256,000 for K2.6).
     # Each call walks the model via ``_get_enclosing_fsdp_module`` AND
     # the finally block calls ``_get_module_name`` per parameter -- so
-    # without caching the export is O(n_linears * n_modules) which is
-    # tens of minutes for Qwen3-MoE and effectively never-completes
-    # for K2.6.  Caching by root_model id makes it O(n_linears + n_modules).
+    # the export is O(n_linears * n_modules) end-to-end.  For Qwen3-MoE
+    # that's ~1e9 ops (tens of minutes); for K2.6 ~3e10 ops (days).
     #
-    # The ``name_to_module`` parameter already exists in the modelopt
-    # signatures, it's just never passed from ``fsdp2_aware_weight_update``
-    # -- this monkey-patch fills that gap from the call site.
+    # Two-part fix:
+    #   1. Cache ``root_model.named_modules()`` keyed on id(root_model)
+    #      so the dict is built once per export.
+    #   2. Replace the linear-scan body with an inverse mapping
+    #      ``id(module) -> name`` so module lookup is O(1).
+    #
+    # Together this drops the export to O(n_linears + n_modules).
+    # ``id()``-keyed lookup is safe within the export step because the
+    # module identity is stable for the lifetime of the cache (we
+    # discard the cache in the ``finally`` below).
     import modelopt.torch.quantization.utils.core_utils as cu
 
-    _name_cache: dict[int, dict[str, nn.Module]] = {}
+    _module_index_cache: dict[int, tuple[dict[str, nn.Module], dict[int, str]]] = {}
 
-    def _cached_named_modules(root_model: nn.Module) -> dict[str, nn.Module]:
+    def _build_index(root_model: nn.Module):
         cache_key = id(root_model)
-        cached = _name_cache.get(cache_key)
+        cached = _module_index_cache.get(cache_key)
         if cached is None:
-            cached = dict(root_model.named_modules())
-            _name_cache[cache_key] = cached
+            name_to_module = dict(root_model.named_modules())
+            id_to_name = {id(m): n for n, m in name_to_module.items()}
+            cached = (name_to_module, id_to_name)
+            _module_index_cache[cache_key] = cached
         return cached
 
     original_get_module_name = cu._get_module_name
     original_get_enclosing = cu._get_enclosing_fsdp_module
 
     def patched_get_module_name(module, root_model, name_to_module=None):
-        if name_to_module is None:
-            name_to_module = _cached_named_modules(root_model)
-        return original_get_module_name(module, root_model, name_to_module)
+        _, id_to_name = _build_index(root_model)
+        return id_to_name.get(id(module))
 
     def patched_get_enclosing(module, root_model, name_to_module=None):
-        if name_to_module is None:
-            name_to_module = _cached_named_modules(root_model)
-        return original_get_enclosing(module, root_model, name_to_module)
+        from torch.distributed.fsdp import FSDPModule
+
+        if isinstance(module, FSDPModule):
+            return module
+        name_to_module, id_to_name = _build_index(root_model)
+        target_module_name = id_to_name.get(id(module))
+        if target_module_name is None:
+            raise ValueError(
+                f"Module {module} not found in the root model {root_model}."
+            )
+        current_name = target_module_name
+        while "." in current_name:
+            parent_name = ".".join(current_name.split(".")[:-1])
+            parent_module = name_to_module.get(parent_name)
+            if parent_module and isinstance(parent_module, FSDPModule):
+                return parent_module
+            current_name = parent_name
+        if isinstance(root_model, FSDPModule):
+            return root_model
+        return None
 
     cu._get_module_name = patched_get_module_name
     cu._get_enclosing_fsdp_module = patched_get_enclosing
@@ -548,7 +575,7 @@ def export_model(
     finally:
         cu._get_module_name = original_get_module_name
         cu._get_enclosing_fsdp_module = original_get_enclosing
-        _name_cache.clear()
+        _module_index_cache.clear()
 
     if accelerator.is_main_process:
         # Save hf_quant_config.json for backward compatibility
