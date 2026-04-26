@@ -370,21 +370,30 @@ def load_and_prepare_model(
             parent._buffers[leaf] = buf.to(accelerator.device)
 
     if accelerator.is_main_process:
-        print("Applying FSDP2 fully_shard per decoder layer...")
+        print("Applying FSDP2 fully_shard per decoder layer + top-level...")
     decoder_layers = _find_decoder_layers(model)
     for layer in decoder_layers:
         fully_shard(layer)
-    # Intentionally NOT calling ``fully_shard(model)`` for the top-level
-    # wrap.  Top-level fully_shard would wrap ``embed_tokens``,
-    # ``lm_head``, and ``final_layernorm`` as DTensors.  modelopt's
-    # layerwise calibration replays individual ``layer.forward`` calls
-    # rather than the full ``model.forward``, so the top-level FSDP2
-    # pre-forward hook (which would unshard embed_tokens for the
-    # embedding lookup) never fires during replay -- the DTensor weight
-    # leaks into ``aten.embedding``, raising "got mixed torch.Tensor and
-    # DTensor".  Leaving these small (~1.7 GiB for K2.x) modules
-    # replicated across ranks costs negligible memory vs. the per-rank
-    # decoder shard footprint and keeps forward semantics intact.
+    # Top-level wrap is required so modelopt's
+    # ``fsdp2_aware_weight_update`` recognises ``model`` as an FSDPModule
+    # during export -- otherwise its ``isinstance(root_model, FSDPModule)``
+    # gate fails, the in-place weight pack step is silently skipped, and
+    # the export gathers BF16 weights instead of the calibrated 4-bit
+    # NVFP4 packed form.
+    #
+    # ``reshard_after_forward=False`` keeps the top-level FSDP unit's
+    # parameters (embed_tokens, lm_head, final_layernorm) unsharded
+    # after forward.  Modelopt's layerwise calibration replays
+    # individual ``layer.forward`` calls rather than the full
+    # ``model.forward``, so the top-level FSDP2 pre-forward hook never
+    # fires during replay; without persistent unshard, embed_tokens'
+    # DTensor leaks into ``aten.embedding`` and raises the mixed-tensor
+    # error.  With ``reshard_after_forward=False`` plus an explicit
+    # ``model.unshard()``, top-level params stay materialised as
+    # Replicate-placement DTensors that the DTensor dispatcher's
+    # embedding kernel can handle correctly.
+    fully_shard(model, reshard_after_forward=False)
+    model.unshard()
 
     # No ``model.to_empty(...)`` call: it would clobber non-meta buffers
     # (RoPE inv_freq etc.) that we just moved up, breaking forward.
