@@ -155,12 +155,98 @@ discovery picked up K2.6's ``KimiK25ForConditionalGeneration ->
 DeepseekV3ForCausalLM``; distributed checkpoint logic ran without
 raising at world_size=4).  The OOM is downstream of their scope.
 
+## Phase 2 e2e validation: Qwen3-30B-A3B on 4x GB200 (2026-04-26)
+
+Both Qwen3-MoE Jobs completed end-to-end and validated each upstream
+commit's contract on real GB200 hardware:
+
+* `job-gb200-qwen3-moe-ptq.yaml` (NVFP4 experts-only, max-calibrate):
+  exited Complete after 11 minutes; export at
+  `/work/quanty/exports/qwen3-moe-nvfp4-experts-only/` (~18 GB across
+  4 safetensors shards + `hf_quant_config.json` for vLLM autodetect).
+  Exercises the **VLM decoder discovery** upstream commit's dispatcher
+  path.
+
+* `job-gb200-qwen3-moe-checkpoint.yaml` (GPTQ + layerwise checkpoint):
+  exited Complete after 3h31m; export at
+  `/work/quanty/exports/qwen3-moe-gptq-layerwise/` (~17 GB).  Rank 0
+  wrote `layer_0000` ... `layer_0047` + `manifest.json` atomically
+  across the run.  Exercises the **distributed-layerwise-checkpoint**
+  upstream commit's rank-0-writer path with `world_size=4`.  No
+  `_CheckpointState` raise, no concurrent-writer hazard.
+
+The Qwen2.5-7B `DynamicCache` cache-replay bug from Phase 0 reproduced
+*exactly* on Qwen3-MoE (same shape mismatch, same line in
+`sdpa_attention_forward`).  Worked around in the launcher carry by
+`model.config.use_cache = False` after `from_pretrained`.  Folding
+this into `model_calib.py:layerwise_calibrate` is a candidate
+upstream PR independent of the two already-pushed branches.
+
+### Regression validation
+
+`job-gb200-qwen3-moe-eval.yaml` runs lm-eval-harness against:
+1. BF16 baseline (`Qwen/Qwen3-30B-A3B`, downloaded from HF, cached on PVC)
+2. NVFP4 experts-only export
+3. GPTQ layerwise export
+
+Tasks: gsm8k (math reasoning, most quantization-sensitive),
+arc_challenge, hellaswag.  vLLM serves all three with the same
+`c2-k25-tf4-i2` image used in production for K2.5 NVFP4.  Regression
+threshold defaults to **1% absolute** on each task; the embedded
+delta script exits non-zero so a CI gate can catch a backslide.
+
+### Artifacts
+
+| Path                                                  | Contents                                  |
+| ----------------------------------------------------- | ----------------------------------------- |
+| `/work/quanty/exports/qwen3-moe-nvfp4-experts-only/`  | NVFP4 max-calibrate export                |
+| `/work/quanty/exports/qwen3-moe-gptq-layerwise/`      | GPTQ layerwise NVFP4 export               |
+| `/work/quanty/exports/qwen3-30b-a3b-bf16/eval-results/` | lm-eval BF16 baseline results           |
+| `/work/quanty/exports/<export>/eval-results/`         | per-export lm-eval results                |
+| `/work/quanty/exports/eval-summary.json`              | regression delta report (PASS/FAIL)       |
+
+## Phase 3: K2.6 multinode FSDP2 PTQ (2026-04-26)
+
+`job-gb200-k26-multinode-ptq.yaml` is the v2 of the single-node OOM
+case from 2026-04-25: same launcher target + recipe + source PVC,
+but spread over 4 GB200 nodes (16 GPUs, ~3 TB HBM total) via Indexed
+Job + headless service rendezvous.  Each rank's peak FSDP2-wrap
+memory is `model_size / world_size + layerwise_overhead`, well under
+the 184 GiB / GB200 budget.
+
+### Why Indexed Job (not MPIJob / KubeRay / PyTorchJob)
+
+* **MPIJob** (`cw-mpijobs.hpc.coreweave.com`) ships with the cluster
+  but adds an MPI wrapper around what is already a torchrun
+  rendezvous; introduces a second layer of process management for
+  no benefit on a torchrun-native script.
+* **PyTorchJob** CRD is not installed.
+* **Indexed Job** (k8s 1.27+) auto-sets `hostname=<job-name>-<index>`
+  and injects `JOB_COMPLETION_INDEX` into each pod, which is
+  everything torchrun needs.  Zero CRD dependency.  We're on 1.35.
+
+Headless Service uses `publishNotReadyAddresses: true` so worker
+pods can DNS-resolve `quanty-gb200-k26-mn-ptq-0.<svc>` before any
+pod becomes Ready -- otherwise rendezvous deadlocks.
+
+### Risks tracked
+
+* **Concurrent writers to scratch dir**: rank 0 owns the `cp -f` +
+  patch step; ranks >= 1 spin on `.scratch-ready` sentinel.
+* **NCCL inter-node**: `NCCL_SOCKET_IFNAME=eth0` matches `c2-k25-*`
+  precedent; IB/NVLS opportunistic enables.
+* **Backoff**: `backoffLimit: 8` so a single-node preemption + resume
+  costs only the in-flight layer's GPTQ work (resume from
+  `manifest.json`).
+
 ## Ground rules
 
 - Do not skip the small-MoE smoke tests before K2.6.  Cluster hours saved
   going straight to K2.6 are dwarfed by debugging when something
   architecture-independent breaks.
 - Do not implement multi-node TP until we have measured signal that
-  single-node 4× GB200 + layerwise is insufficient.
+  single-node 4× GB200 + layerwise is insufficient.  The 16x GB200
+  multinode FSDP2 path is *not* TP -- it's data/model sharding via
+  FSDP2's mesh and was always in scope for v1.
 - Do not amend the carry commit on `feat/quanty/...` once it's pushed;
   stack new commits on top so the upstream-cherry-picks rebase cleanly.

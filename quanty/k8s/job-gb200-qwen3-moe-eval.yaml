@@ -1,0 +1,243 @@
+---
+# Phase 2 e2e validation: lm-eval regression of the two Qwen3-30B-A3B
+# NVFP4 exports against the BF16 baseline.
+#
+# Three sequential runs in one Job:
+#   (1) Qwen/Qwen3-30B-A3B   -- BF16 baseline (downloaded from HF)
+#   (2) /work/.../qwen3-moe-nvfp4-experts-only  -- max-calibrate NVFP4
+#   (3) /work/.../qwen3-moe-gptq-layerwise      -- GPTQ layerwise NVFP4
+#
+# Tasks: gsm8k (math reasoning, most quantization-sensitive),
+# arc_challenge (commonsense), hellaswag (subsampled).  Limited to
+# ${EVAL_LIMIT} samples per task by default (smoke), set to 0 for full.
+#
+# Regression goal: <1% absolute delta on aggregate accuracy.  If
+# delta exceeds threshold the Job exits non-zero so a CI gate can
+# catch it.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: quanty-gb200-qwen3-moe-eval
+  namespace: ace-inference
+  labels:
+    app: quanty-gb200-qwen3-moe-eval
+    workstream: e2e-validation-eval
+    owner: aeldeib
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels:
+        app: quanty-gb200-qwen3-moe-eval
+        owner: aeldeib
+    spec:
+      restartPolicy: OnFailure
+      schedulerName: binpack-scheduler
+      priorityClassName: inference-partial-node
+      imagePullSecrets:
+        - name: inference-backends-image-pull-secret
+        - name: cloudsmith-pull-secret
+      nodeSelector:
+        node.coreweave.cloud/type: gb200-4x-l
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      volumes:
+        - name: ckpt
+          persistentVolumeClaim:
+            claimName: k26-nvfp4-ckpt
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+      containers:
+        - name: harness
+          # Same vLLM image c2-k25-tf4-i2 uses for K2.5 NVFP4 in production.
+          # Known-working FlashInfer NVFP4 MoE on Blackwell.
+          image: docker.cloudsmith.io/coreweave/infr-dev/vllm:5d30111d6ff29fd35220539d55d24b83121a0ec4
+          imagePullPolicy: IfNotPresent
+          workingDir: /work
+          env:
+            - name: HF_HOME
+              value: /work/hf-cache
+            - name: TRANSFORMERS_CACHE
+              value: /work/hf-cache
+            - name: HF_HUB_ENABLE_HF_TRANSFER
+              value: "1"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: k26-hf-secret
+                  key: HF_TOKEN
+                  optional: true
+            # NVFP4 MoE serving on Blackwell
+            - name: VLLM_USE_FLASHINFER_MOE_FP4
+              value: "1"
+            - name: VLLM_FLASHINFER_MOE_BACKEND
+              value: throughput
+            - name: NCCL_DEBUG
+              value: "WARN"
+            # Eval knobs (override via kubectl edit / kustomize / set env)
+            - name: EVAL_TASKS
+              value: "gsm8k,arc_challenge,hellaswag"
+            - name: EVAL_LIMIT
+              value: "500"
+            - name: EVAL_BATCH_SIZE
+              value: "auto"
+            - name: REGRESSION_THRESHOLD_PCT
+              value: "1.0"
+          resources:
+            limits:
+              nvidia.com/gpu: 4
+              memory: 700Gi
+              cpu: 64
+            requests:
+              nvidia.com/gpu: 4
+              memory: 600Gi
+              cpu: 48
+          volumeMounts:
+            - name: ckpt
+              mountPath: /work
+            - name: shm
+              mountPath: /dev/shm
+          command:
+            - bash
+            - -lc
+            - |
+              set -euo pipefail
+
+              # The c2-k25-tf4-i2 vLLM image ships with vllm + transformers
+              # + datasets but lm-eval-harness is not pre-installed.
+              if ! python -c "import lm_eval" >/dev/null 2>&1; then
+                  echo ">>> installing lm-eval-harness"
+                  pip install --quiet "lm-eval[vllm]>=0.4.5"
+              fi
+
+              EXPORTS_DIR="/work/quanty/exports"
+              SUMMARY="${EXPORTS_DIR}/eval-summary.json"
+              mkdir -p "${EXPORTS_DIR}"
+
+              # vLLM launcher args common across all three runs.
+              # tensor_parallel_size=4 sharded over 4 GPUs for headroom.
+              # gpu_memory_utilization tuned conservatively because
+              # lm-eval may instantiate a second batch alongside.
+              # max_model_len bounded to keep KV memory predictable.
+              VLLM_BASE_ARGS="tensor_parallel_size=4,gpu_memory_utilization=0.85,max_model_len=4096,trust_remote_code=True"
+
+              if [ "${EVAL_LIMIT}" = "0" ] || [ -z "${EVAL_LIMIT}" ]; then
+                  LIMIT_ARG=""
+              else
+                  LIMIT_ARG="--limit ${EVAL_LIMIT}"
+              fi
+
+              harness_run() {
+                  local label="$1"
+                  local model_path="$2"
+                  local extra_args="${3:-}"
+                  local out_dir="${EXPORTS_DIR}/${label}/eval-results"
+                  mkdir -p "${out_dir}"
+                  echo
+                  echo "================================================================"
+                  echo "lm-eval :: ${label}"
+                  echo "  pretrained=${model_path}"
+                  echo "  tasks=${EVAL_TASKS}  limit=${EVAL_LIMIT}"
+                  echo "================================================================"
+                  lm_eval \
+                      --model vllm \
+                      --model_args "pretrained=${model_path},${VLLM_BASE_ARGS}${extra_args}" \
+                      --tasks "${EVAL_TASKS}" \
+                      --batch_size "${EVAL_BATCH_SIZE}" \
+                      ${LIMIT_ARG} \
+                      --output_path "${out_dir}" \
+                      --log_samples \
+                      2>&1 | tee "${out_dir}/run.log"
+              }
+
+              # 1. BF16 baseline.  dtype=bfloat16 is explicit so vLLM
+              #    doesn't try to autodetect and pull a quantization branch.
+              harness_run "qwen3-30b-a3b-bf16" "Qwen/Qwen3-30B-A3B" ",dtype=bfloat16"
+
+              # 2. NVFP4 experts-only (max-calibrate recipe).
+              #    No --quantization flag: vLLM autodetects from
+              #    hf_quant_config.json that modelopt wrote.
+              harness_run "qwen3-moe-nvfp4-experts-only" \
+                  "${EXPORTS_DIR}/qwen3-moe-nvfp4-experts-only" \
+                  ""
+
+              # 3. GPTQ layerwise (distributed-checkpoint upstream commit).
+              harness_run "qwen3-moe-gptq-layerwise" \
+                  "${EXPORTS_DIR}/qwen3-moe-gptq-layerwise" \
+                  ""
+
+              # ----------------------------------------------------------------
+              # Regression delta vs BF16 baseline.  lm-eval writes
+              # results_<timestamp>.json under each output_path; we read
+              # the latest from each, compute per-task delta, and exit
+              # non-zero if any task exceeds the threshold.
+              # ----------------------------------------------------------------
+              python <<'PY' | tee "${SUMMARY}"
+              import glob
+              import json
+              import os
+              import sys
+
+              EXPORTS = "/work/quanty/exports"
+              THRESHOLD = float(os.environ["REGRESSION_THRESHOLD_PCT"]) / 100.0
+              BASELINE = "qwen3-30b-a3b-bf16"
+              CANDIDATES = ["qwen3-moe-nvfp4-experts-only", "qwen3-moe-gptq-layerwise"]
+
+              def latest_results(label: str) -> dict:
+                  pattern = f"{EXPORTS}/{label}/eval-results/**/results_*.json"
+                  paths = sorted(glob.glob(pattern, recursive=True))
+                  if not paths:
+                      raise FileNotFoundError(f"no results json under {pattern}")
+                  with open(paths[-1]) as f:
+                      return json.load(f)
+
+              def primary_metric(task_results: dict) -> tuple[str, float]:
+                  for key in ("acc,none", "exact_match,strict-match",
+                              "exact_match,flexible-extract", "acc_norm,none"):
+                      if key in task_results:
+                          return key, float(task_results[key])
+                  for key, val in task_results.items():
+                      if isinstance(val, (int, float)) and not key.endswith("_stderr"):
+                          return key, float(val)
+                  raise ValueError(f"no scalar metric in {list(task_results)}")
+
+              base = latest_results(BASELINE)["results"]
+              report = {"baseline": BASELINE,
+                        "threshold_pct": THRESHOLD * 100,
+                        "candidates": {}}
+              regressed = []
+
+              for cand in CANDIDATES:
+                  cand_res = latest_results(cand)["results"]
+                  per_task = {}
+                  for task, base_metrics in base.items():
+                      if task not in cand_res:
+                          continue
+                      base_key, base_v = primary_metric(base_metrics)
+                      _, cand_v = primary_metric(cand_res[task])
+                      delta = cand_v - base_v
+                      per_task[task] = {"metric": base_key,
+                                        "baseline": base_v,
+                                        "candidate": cand_v,
+                                        "delta": delta,
+                                        "delta_pct": delta * 100}
+                      if abs(delta) > THRESHOLD:
+                          regressed.append((cand, task, delta))
+                  report["candidates"][cand] = per_task
+
+              print(json.dumps(report, indent=2))
+
+              if regressed:
+                  print(f"\nFAIL: {len(regressed)} task(s) exceed +/-{THRESHOLD*100:.2f}%:")
+                  for c, t, d in regressed:
+                      print(f"  {c} :: {t} delta={d*100:+.3f}%")
+                  sys.exit(1)
+              print(f"\nPASS: all candidates within +/-{THRESHOLD*100:.2f}% of baseline")
+              PY

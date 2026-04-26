@@ -1,11 +1,15 @@
 # Quanty k8s manifests — ace-inference / cw4637-dev-us-e-01a
 
-Two job profiles for FSDP2 layerwise NVFP4 PTQ work:
+Five job profiles covering the full PTQ -> validation pipeline:
 
-| File                                     | Purpose                                | Hardware          |
-| ---------------------------------------- | -------------------------------------- | ----------------- |
-| `job-rtxpro6000-discovery.yaml`          | Phase 0 discovery on small MoE         | 8× RTX Pro 6000   |
-| `job-gb200-k26-ptq-fast.yaml`            | K2.6 NVFP4 multinode-layerwise PTQ     | 4× GB200          |
+| File                                       | Purpose                                                        | Hardware          |
+| ------------------------------------------ | -------------------------------------------------------------- | ----------------- |
+| `job-rtxpro6000-discovery.yaml`            | Phase 0 discovery on small MoE                                 | 8× RTX Pro 6000   |
+| `job-gb200-qwen3-moe-ptq.yaml`             | Phase 2 e2e: Qwen3-30B-A3B NVFP4 experts-only (max-calibrate)  | 4× GB200          |
+| `job-gb200-qwen3-moe-checkpoint.yaml`      | Phase 2 e2e: Qwen3-30B-A3B GPTQ + distributed-checkpoint upstream commit | 4× GB200 |
+| `job-gb200-qwen3-moe-eval.yaml`            | Phase 2 e2e: lm-eval regression vs BF16 baseline (<1% delta gate) | 4× GB200       |
+| `job-gb200-k26-ptq-fast.yaml`              | K2.6 NVFP4 single-node (OOMs; documented in `quanty_strategy.md`) | 4× GB200       |
+| `job-gb200-k26-multinode-ptq.yaml`         | K2.6 NVFP4 multinode FSDP2 PTQ (Phase 3)                       | 16× GB200 (4×4)   |
 
 The team's existing `k26-quantize-nvfp4` Job (single-node, INT4 source,
 patched-up modelopt main) remains the source of truth.  These manifests
@@ -46,10 +50,30 @@ fixes in this branch clean.
 kubectl -n ace-inference apply -f job-rtxpro6000-discovery.yaml
 kubectl -n ace-inference logs -l app=quanty-rtxpro6000-discovery -f --max-log-requests=8
 
-# Phase 3+: full K2.6 NVFP4 PTQ on 4x GB200
-kubectl -n ace-inference apply -f job-gb200-k26-ptq-fast.yaml
-kubectl -n ace-inference logs -l app=quanty-gb200-k26-ptq-fast -f
+# Phase 2: e2e validation on Qwen3-30B-A3B (small MoE, fits 4x GB200)
+kubectl -n ace-inference apply -f job-gb200-qwen3-moe-ptq.yaml          # NVFP4 max-calibrate
+kubectl -n ace-inference apply -f job-gb200-qwen3-moe-checkpoint.yaml   # GPTQ + dist-checkpoint
+kubectl -n ace-inference apply -f job-gb200-qwen3-moe-eval.yaml         # lm-eval regression
+
+# Phase 3: K2.6 multinode FSDP2 PTQ on 16x GB200 (4 nodes x 4 GPUs)
+kubectl -n ace-inference apply -f job-gb200-k26-multinode-ptq.yaml
+kubectl -n ace-inference logs -l app=quanty-gb200-k26-mn-ptq -f --max-log-requests=8
 ```
 
 Outputs land on `k26-nvfp4-ckpt` PVC under
 `/work/quanty/{checkpoints,exports}/<run-id>/`.
+
+The eval Job exits non-zero if any candidate's gsm8k / arc_challenge /
+hellaswag accuracy regresses by more than `REGRESSION_THRESHOLD_PCT`
+(default 1.0%) versus the BF16 baseline.  Override on apply:
+
+```bash
+kubectl -n ace-inference set env job/quanty-gb200-qwen3-moe-eval \
+    EVAL_LIMIT=0 REGRESSION_THRESHOLD_PCT=0.5     # full eval, tighter gate
+```
+
+The K2.6 multinode Job uses an Indexed completion mode + headless
+service so each pod's hostname (`quanty-gb200-k26-mn-ptq-<index>`)
+resolves under the `quanty-gb200-k26-mn-rdzv` subdomain.  Pod-0 is
+the torchrun rendezvous master at `:29500`; the launcher reads
+`JOB_COMPLETION_INDEX` for `--node-rank`.
