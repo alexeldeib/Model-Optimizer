@@ -11,9 +11,15 @@
 # arc_challenge (commonsense), hellaswag (subsampled).  Limited to
 # ${EVAL_LIMIT} samples per task by default (smoke), set to 0 for full.
 #
-# Regression goal: <1% absolute delta on aggregate accuracy.  If
-# delta exceeds threshold the Job exits non-zero so a CI gate can
-# catch it.
+# Regression gate: a candidate is considered to have regressed iff
+# both: (a) abs(delta) > REGRESSION_THRESHOLD_PCT, AND (b) abs(delta)
+# is outside the 2-sigma combined CI of baseline + candidate stderr.
+# This prevents sample noise at small EVAL_LIMIT (e.g. hellaswag at
+# 500 samples has stderr ~ 2.2%) from tripping a fixed-percent gate.
+#
+# Idempotency: if a model's results json already exists, that eval
+# is skipped on Job retry.  Wipe ``/work/quanty/exports/<label>/eval-results``
+# to force a re-run.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -140,6 +146,17 @@ spec:
                   local extra_args="${3:-}"
                   local out_dir="${EXPORTS_DIR}/${label}/eval-results"
                   mkdir -p "${out_dir}"
+                  # Idempotency: if a results json already exists for
+                  # this label, the eval has been done -- skip and let
+                  # the regression script pick it up.  Saves the full
+                  # 30-60 minute eval run on a backoffLimit retry so
+                  # only the gate re-executes.  Force a re-run by
+                  # deleting eval-results/ before applying the Job.
+                  if compgen -G "${out_dir}/**/results_*.json" >/dev/null 2>&1 \
+                      || compgen -G "${out_dir}/results_*.json" >/dev/null 2>&1; then
+                      echo "lm-eval :: ${label} -- existing results found, skipping eval"
+                      return 0
+                  fi
                   echo
                   echo "================================================================"
                   echo "lm-eval :: ${label}"
@@ -177,11 +194,21 @@ spec:
               # Regression delta vs BF16 baseline.  lm-eval writes
               # results_<timestamp>.json under each output_path; we read
               # the latest from each, compute per-task delta, and exit
-              # non-zero if any task exceeds the threshold.
+              # non-zero if any task exceeds the threshold AND is
+              # statistically significant beyond 2 sigma combined.
+              #
+              # Why stderr-aware: at small EVAL_LIMIT the per-task stderr
+              # can dwarf the threshold (e.g. hellaswag at limit=500 has
+              # sigma ~ 0.022 -> 2-sigma combined ~ 4.4%).  Without the
+              # band check, sample noise alone trips the gate.  With it,
+              # only a delta that is BOTH past the threshold AND outside
+              # the 95% CI counts as a regression -- so the gate is
+              # trustworthy at any sample size.
               # ----------------------------------------------------------------
               python <<'PY' | tee "${SUMMARY}"
               import glob
               import json
+              import math
               import os
               import sys
 
@@ -189,6 +216,11 @@ spec:
               THRESHOLD = float(os.environ["REGRESSION_THRESHOLD_PCT"]) / 100.0
               BASELINE = "qwen3-30b-a3b-bf16"
               CANDIDATES = ["qwen3-moe-nvfp4-experts-only", "qwen3-moe-gptq-layerwise"]
+
+              # Preferred metrics in priority order; the matching
+              # _stderr key shares the suffix after the comma.
+              METRIC_KEYS = ("acc,none", "exact_match,strict-match",
+                             "exact_match,flexible-extract", "acc_norm,none")
 
               def latest_results(label: str) -> dict:
                   pattern = f"{EXPORTS}/{label}/eval-results/**/results_*.json"
@@ -198,19 +230,23 @@ spec:
                   with open(paths[-1]) as f:
                       return json.load(f)
 
-              def primary_metric(task_results: dict) -> tuple[str, float]:
-                  for key in ("acc,none", "exact_match,strict-match",
-                              "exact_match,flexible-extract", "acc_norm,none"):
+              def primary_metric(task_results: dict) -> tuple[str, float, float]:
+                  """Return (key, value, stderr).  stderr is 0.0 if missing."""
+                  for key in METRIC_KEYS:
                       if key in task_results:
-                          return key, float(task_results[key])
+                          name, suffix = key.split(",", 1)
+                          stderr_key = f"{name}_stderr,{suffix}"
+                          stderr = float(task_results.get(stderr_key, 0.0))
+                          return key, float(task_results[key]), stderr
                   for key, val in task_results.items():
                       if isinstance(val, (int, float)) and not key.endswith("_stderr"):
-                          return key, float(val)
+                          return key, float(val), 0.0
                   raise ValueError(f"no scalar metric in {list(task_results)}")
 
               base = latest_results(BASELINE)["results"]
               report = {"baseline": BASELINE,
                         "threshold_pct": THRESHOLD * 100,
+                        "noise_band_sigma": 2.0,
                         "candidates": {}}
               regressed = []
 
@@ -220,24 +256,32 @@ spec:
                   for task, base_metrics in base.items():
                       if task not in cand_res:
                           continue
-                      base_key, base_v = primary_metric(base_metrics)
-                      _, cand_v = primary_metric(cand_res[task])
+                      base_key, base_v, base_se = primary_metric(base_metrics)
+                      _, cand_v, cand_se = primary_metric(cand_res[task])
                       delta = cand_v - base_v
+                      noise_band = 2.0 * math.sqrt(base_se ** 2 + cand_se ** 2)
+                      # Significant only if BOTH past threshold AND past 2-sigma.
+                      significant = (abs(delta) > THRESHOLD) and (abs(delta) > noise_band)
                       per_task[task] = {"metric": base_key,
                                         "baseline": base_v,
+                                        "baseline_stderr": base_se,
                                         "candidate": cand_v,
+                                        "candidate_stderr": cand_se,
                                         "delta": delta,
-                                        "delta_pct": delta * 100}
-                      if abs(delta) > THRESHOLD:
-                          regressed.append((cand, task, delta))
+                                        "delta_pct": delta * 100,
+                                        "noise_band_pct": noise_band * 100,
+                                        "significant_regression": significant}
+                      if significant:
+                          regressed.append((cand, task, delta, noise_band))
                   report["candidates"][cand] = per_task
 
               print(json.dumps(report, indent=2))
 
               if regressed:
-                  print(f"\nFAIL: {len(regressed)} task(s) exceed +/-{THRESHOLD*100:.2f}%:")
-                  for c, t, d in regressed:
-                      print(f"  {c} :: {t} delta={d*100:+.3f}%")
+                  print(f"\nFAIL: {len(regressed)} significant regression(s):")
+                  for c, t, d, nb in regressed:
+                      print(f"  {c} :: {t} delta={d*100:+.3f}% "
+                            f"(threshold={THRESHOLD*100:.2f}%, 2-sigma={nb*100:.2f}%)")
                   sys.exit(1)
-              print(f"\nPASS: all candidates within +/-{THRESHOLD*100:.2f}% of baseline")
+              print(f"\nPASS: all candidate deltas within max(+/-{THRESHOLD*100:.2f}%, 2-sigma) of baseline")
               PY
