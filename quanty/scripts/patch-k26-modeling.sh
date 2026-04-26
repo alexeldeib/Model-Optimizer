@@ -56,3 +56,43 @@ if [[ -f "${DEEPSEEK}" ]]; then
 else
     echo "skip: ${DEEPSEEK} not present" >&2
 fi
+
+# Bug 3: K2.6's ``tokenization_kimi.py`` imports
+# ``bytes_to_unicode`` from ``transformers.convert_slow_tokenizer``.
+# That re-export was dropped in transformers 5.x (it now lives only
+# under ``transformers.models.gpt2.tokenization_gpt2``).  Inline the
+# canonical implementation so the module loads cleanly.
+TOKENIZER="${SRC}/tokenization_kimi.py"
+if [[ -f "${TOKENIZER}" ]]; then
+    if grep -q "from transformers.convert_slow_tokenizer import bytes_to_unicode" "${TOKENIZER}"; then
+        # Inline polyfill -- the canonical GPT-2 bytes-to-unicode mapping.
+        python3 - "${TOKENIZER}" <<'PY'
+import sys, pathlib
+path = pathlib.Path(sys.argv[1])
+src = path.read_text()
+old = "from transformers.convert_slow_tokenizer import bytes_to_unicode"
+new = (
+    "# quanty: transformers 5.x dropped the convert_slow_tokenizer re-export.\n"
+    "def bytes_to_unicode():\n"
+    "    bs = (list(range(ord('!'), ord('~') + 1))\n"
+    "          + list(range(ord('¡'), ord('¬') + 1))\n"
+    "          + list(range(ord('®'), ord('ÿ') + 1)))\n"
+    "    cs = bs[:]\n"
+    "    n = 0\n"
+    "    for b in range(2 ** 8):\n"
+    "        if b not in bs:\n"
+    "            bs.append(b)\n"
+    "            cs.append(2 ** 8 + n)\n"
+    "            n += 1\n"
+    "    return dict(zip(bs, [chr(c) for c in cs]))\n"
+)
+if old in src:
+    path.write_text(src.replace(old, new))
+PY
+        echo "patched: ${TOKENIZER}"
+    else
+        echo "already patched: ${TOKENIZER}"
+    fi
+else
+    echo "skip: ${TOKENIZER} not present" >&2
+fi
