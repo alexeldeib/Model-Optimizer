@@ -492,17 +492,63 @@ def export_model(
     export_dir = Path(export_path)
     export_dir.mkdir(parents=True, exist_ok=True)
 
-    # The ``Accelerator`` was constructed with a
-    # ``FullyShardedDataParallelPlugin`` (fsdp_version=2,
-    # state_dict_type=FULL_STATE_DICT) so ``accelerator.get_state_dict``
-    # uses the FSDP2-aware gather path natively.  No monkey-patch
-    # needed -- a previous attempt with a custom ``get_model_state_dict``
-    # wrapper hung indefinitely in the postprocess collectives, likely
-    # because the manual wrapper bypassed accelerator's per-FSDP-unit
-    # synchronisation that ``_process_quantized_modules`` relies on.
-    post_state_dict, hf_quant_config = _export_transformers_checkpoint(
-        model, torch.bfloat16, accelerator=accelerator
-    )
+    # Patch ``_get_module_name`` and ``_get_enclosing_fsdp_module`` to
+    # cache the ``root_model.named_modules()`` dict.  The base
+    # implementation rebuilds the dict on every call:
+    #
+    #     def _get_module_name(module, root_model, name_to_module=None):
+    #         if name_to_module is None:
+    #             name_to_module = dict(root_model.named_modules())   # O(n)
+    #         target_module_name = next((name for name, m in name_to_module.items() if m is module), None)
+    #         return target_module_name
+    #
+    # ``_process_quantized_modules`` calls ``fsdp2_aware_weight_update``
+    # per quantized linear (~18,000 for Qwen3-MoE, ~256,000 for K2.6).
+    # Each call walks the model via ``_get_enclosing_fsdp_module`` AND
+    # the finally block calls ``_get_module_name`` per parameter -- so
+    # without caching the export is O(n_linears * n_modules) which is
+    # tens of minutes for Qwen3-MoE and effectively never-completes
+    # for K2.6.  Caching by root_model id makes it O(n_linears + n_modules).
+    #
+    # The ``name_to_module`` parameter already exists in the modelopt
+    # signatures, it's just never passed from ``fsdp2_aware_weight_update``
+    # -- this monkey-patch fills that gap from the call site.
+    import modelopt.torch.quantization.utils.core_utils as cu
+
+    _name_cache: dict[int, dict[str, nn.Module]] = {}
+
+    def _cached_named_modules(root_model: nn.Module) -> dict[str, nn.Module]:
+        cache_key = id(root_model)
+        cached = _name_cache.get(cache_key)
+        if cached is None:
+            cached = dict(root_model.named_modules())
+            _name_cache[cache_key] = cached
+        return cached
+
+    original_get_module_name = cu._get_module_name
+    original_get_enclosing = cu._get_enclosing_fsdp_module
+
+    def patched_get_module_name(module, root_model, name_to_module=None):
+        if name_to_module is None:
+            name_to_module = _cached_named_modules(root_model)
+        return original_get_module_name(module, root_model, name_to_module)
+
+    def patched_get_enclosing(module, root_model, name_to_module=None):
+        if name_to_module is None:
+            name_to_module = _cached_named_modules(root_model)
+        return original_get_enclosing(module, root_model, name_to_module)
+
+    cu._get_module_name = patched_get_module_name
+    cu._get_enclosing_fsdp_module = patched_get_enclosing
+
+    try:
+        post_state_dict, hf_quant_config = _export_transformers_checkpoint(
+            model, torch.bfloat16, accelerator=accelerator
+        )
+    finally:
+        cu._get_module_name = original_get_module_name
+        cu._get_enclosing_fsdp_module = original_get_enclosing
+        _name_cache.clear()
 
     if accelerator.is_main_process:
         # Save hf_quant_config.json for backward compatibility
