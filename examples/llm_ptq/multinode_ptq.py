@@ -31,8 +31,8 @@ import torch.nn as nn
 from accelerate import Accelerator, init_empty_weights
 from example_utils import build_quant_cfg, get_tokenizer
 from modelopt.recipe import ModelOptPTQRecipe, load_recipe
+from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 from torch.distributed.fsdp import fully_shard
-from torch.distributed.tensor import DTensor, distribute_tensor
 from tqdm import tqdm
 from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedTokenizer, PreTrainedTokenizerFast
 
@@ -172,35 +172,37 @@ def _load_sharded_weights_from_safetensors(
 ) -> None:
     """Per-rank sharded read from HF safetensors into FSDP2-wrapped model.
 
-    Each rank reads each tensor on demand and uses ``distribute_tensor`` to
-    slice it into its FSDP2 shard placement, then frees the full copy.
-    Peak memory per rank is one tensor at a time -- never the full model
-    on any rank.
+    Each rank loads one safetensors shard at a time (~30 GiB peak per
+    rank, fits the per-node CPU budget) and feeds it to PyTorch's
+    ``set_model_state_dict`` with ``full_state_dict=True``.  That API
+    handles meta-tensor allocation and DTensor placement-aware slicing
+    automatically: rank-local shards are populated in place; storage
+    is allocated lazily on the rank's device.
 
     Required because for trillion-parameter MoE models like Kimi K2.x
-    (~2 TB BF16) the standard HF ``from_pretrained`` materializes the
+    (~2 TB BF16) the standard HF ``from_pretrained`` materialises the
     full model on every pod's HBM (or every rank-0 CPU with
     ``cpu_ram_efficient_loading=True``), exceeding both the per-pod
     HBM (4 GPUs * 184 GiB = 736 GiB) and the per-node CPU RAM (~1 TB).
 
     Args:
-        model: Model with structure already set up (e.g. via
-            ``init_empty_weights`` + ``from_config``) and FSDP2-wrapped
-            via ``fully_shard``.  Parameters should be DTensors on real
-            (non-meta) device storage; call ``model.to_empty(device=...)``
-            before this function.
-        model_path: Directory containing ``*.safetensors`` shards and
-            either ``model.safetensors.index.json`` (sharded) or a single
-            ``model.safetensors`` file.
+        model: Model with structure already built via
+            ``init_empty_weights`` + ``from_config`` and FSDP2-wrapped
+            via ``fully_shard``.  Parameters' local DTensor shards may
+            still be on the meta device; ``set_model_state_dict``
+            allocates real storage on first write.
+        model_path: Directory with ``*.safetensors`` shards and either
+            ``model.safetensors.index.json`` or a single
+            ``model.safetensors``.
         accelerator: Accelerator instance for rank/device info.
     """
-    device = accelerator.device
     model_dir = Path(model_path)
 
     index_file = model_dir / "model.safetensors.index.json"
     if index_file.exists():
         with open(index_file) as fh:
             weight_map: dict[str, str] = json.load(fh)["weight_map"]
+        shard_files = sorted(set(weight_map.values()))
     else:
         single = model_dir / "model.safetensors"
         if not single.exists():
@@ -208,59 +210,42 @@ def _load_sharded_weights_from_safetensors(
                 f"No safetensors checkpoint at {model_dir} "
                 "(expected model.safetensors.index.json or model.safetensors)"
             )
-        with safetensors.safe_open(str(single), framework="pt", device="cpu") as fh:
-            weight_map = {k: "model.safetensors" for k in fh.keys()}
+        shard_files = ["model.safetensors"]
 
-    tensors_by_shard: dict[str, list[str]] = {}
-    for tname, shard in weight_map.items():
-        tensors_by_shard.setdefault(shard, []).append(tname)
+    # ``broadcast_from_rank0=False``: each rank already loaded the same
+    # shard from the shared PVC, so no NCCL broadcast needed.  ``strict
+    # =False``: each shard contains only a subset of the model's keys;
+    # the rest will be filled by subsequent shards.  ``full_state_dict
+    # =True``: the loaded tensors are the unsharded global weights, so
+    # set_model_state_dict will use ``distribute_tensor`` internally to
+    # slice them into rank-local DTensor shards.
+    options = StateDictOptions(
+        full_state_dict=True,
+        broadcast_from_rank0=False,
+        strict=False,
+    )
 
-    name_to_target: dict[str, tuple[torch.Tensor, str]] = {
-        n: (p, "param") for n, p in model.named_parameters()
-    }
-    for n, b in model.named_buffers():
-        name_to_target.setdefault(n, (b, "buffer"))
-
-    n_shards = len(tensors_by_shard)
+    n_shards = len(shard_files)
     if accelerator.is_main_process:
         print(
             f"Sharded load: {n_shards} safetensors files, "
             f"world_size={accelerator.num_processes}"
         )
 
-    n_loaded = 0
-    n_skipped = 0
-    for i, shard_file in enumerate(sorted(tensors_by_shard.keys())):
+    for i, shard_file in enumerate(shard_files):
         shard_path = str(model_dir / shard_file)
+        state_dict: dict[str, torch.Tensor] = {}
         with safetensors.safe_open(shard_path, framework="pt", device="cpu") as fh:
-            for tname in tensors_by_shard[shard_file]:
-                target = name_to_target.get(tname)
-                if target is None:
-                    n_skipped += 1
-                    continue
-                tensor, kind = target
-                full = fh.get_tensor(tname).to(device, dtype=tensor.dtype, non_blocking=True)
-                if isinstance(tensor, DTensor):
-                    distributed = distribute_tensor(
-                        full, tensor.device_mesh, tensor.placements
-                    )
-                    with torch.no_grad():
-                        tensor.copy_(distributed)
-                    del distributed
-                elif kind == "param":
-                    with torch.no_grad():
-                        tensor.data.copy_(full)
-                else:
-                    with torch.no_grad():
-                        tensor.copy_(full)
-                del full
-                n_loaded += 1
+            for key in fh.keys():
+                state_dict[key] = fh.get_tensor(key)
+        set_model_state_dict(model, state_dict, options=options)
+        del state_dict
         if accelerator.is_main_process and ((i + 1) % 8 == 0 or (i + 1) == n_shards):
             print(f"  shard {i + 1}/{n_shards}: {shard_file}")
 
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        print(f"Sharded load complete: {n_loaded} tensors loaded, {n_skipped} skipped")
+        print("Sharded load complete.")
 
 
 def load_and_prepare_model(
@@ -329,6 +314,26 @@ def load_and_prepare_model(
     model_type = get_model_type(model)
     original_architectures = model.config.architectures
 
+    # Move CPU-resident buffers (e.g. precomputed RoPE inv_freq) to the
+    # rank's CUDA device.  ``init_empty_weights`` only redirects
+    # parameters to meta; buffers retain their __init__-computed values
+    # on CPU, so we need to copy them up before FSDP2 wrap so the wrap
+    # sees them on the correct device.  ``model.to(device)`` would also
+    # try to move meta params and either error or allocate full-tensor
+    # storage on each rank (breaking the no-rank-holds-full-model
+    # invariant), so we walk buffers explicitly.
+    if accelerator.is_main_process:
+        print(f"Moving CPU buffers to {accelerator.device}...")
+    for name, buf in list(model.named_buffers()):
+        if buf is None or buf.is_meta:
+            continue
+        if buf.device.type == "cpu":
+            *parent_path, leaf = name.split(".")
+            parent = model
+            for p in parent_path:
+                parent = getattr(parent, p)
+            parent._buffers[leaf] = buf.to(accelerator.device)
+
     if accelerator.is_main_process:
         print("Applying FSDP2 fully_shard per decoder layer...")
     decoder_layers = _find_decoder_layers(model)
@@ -336,13 +341,10 @@ def load_and_prepare_model(
         fully_shard(layer)
     fully_shard(model)
 
-    # Allocate real (uninitialized) storage for each rank's FSDP2 shard.
-    # Without this, ``param._local_tensor`` remains on the meta device
-    # and copy_ into it is a no-op.
-    if accelerator.is_main_process:
-        print(f"Allocating per-rank shard storage on {accelerator.device}...")
-    model.to_empty(device=accelerator.device)
-
+    # No ``model.to_empty(...)`` call: it would clobber non-meta buffers
+    # (RoPE inv_freq etc.) that we just moved up, breaking forward.
+    # ``set_model_state_dict`` allocates real storage for meta param
+    # shards on first write, so we go straight to the loader.
     _load_sharded_weights_from_safetensors(model, model_path, accelerator)
 
     calibration_dataloader = accelerator.prepare(calib_dataloader)
