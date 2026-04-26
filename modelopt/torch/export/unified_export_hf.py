@@ -315,10 +315,22 @@ def _fuse_shared_input_modules(
 
 def requantize_resmooth_fused_llm_layers(model: torch.nn.Module):
     """Group modules that take the same input and register shared parameters in module."""
+    import time as _qty_t
+    _qty_rs0 = _qty_t.monotonic()
+    def _qty_rs(msg):
+        try:
+            import torch.distributed as _qty_d
+            if _qty_d.is_initialized() and _qty_d.get_rank() != 0:
+                return
+        except Exception:
+            pass
+        print(f"[rs +{_qty_t.monotonic()-_qty_rs0:7.2f}s] {msg}", flush=True)
+    _qty_rs("entered requantize_resmooth_fused_llm_layers")
     # TODO: Handle DBRX MoE
     quantization_format = get_quantization_format(model)
     model_type = type(model).__name__.lower()
     module_names = set()
+    _qty_rs(f"qfmt={quantization_format} model_type={model_type}")
 
     # NVFP4 SVDQuant does not need pre-quant scale fusion (either into previous linear or layernorm) because
     # 1) its kernel handles pre-quant scale.
@@ -387,9 +399,11 @@ def requantize_resmooth_fused_llm_layers(model: torch.nn.Module):
         else:
             model(fake_input)
 
+    _qty_rs("calling collect_shared_input_modules (runs dummy forward)")
     input_to_linear, output_to_layernorm = collect_shared_input_modules(
         model, llm_dummy_forward, collect_layernorms=True
     )
+    _qty_rs(f"collect_shared_input_modules done; input_to_linear={len(input_to_linear)} output_to_layernorm={len(output_to_layernorm)}")
 
     fused_linears = _fuse_shared_input_modules(
         model,
@@ -399,9 +413,11 @@ def requantize_resmooth_fused_llm_layers(model: torch.nn.Module):
         fuse_layernorms=True,
         quantization_format=quantization_format,
     )
+    _qty_rs(f"_fuse_shared_input_modules done; fused_linears={len(fused_linears)}")
 
     # The dummy forward may not be able to activate all the experts.
     # Process experts by naming rules like experts.0, experts.1, etc.
+    _expert_loop_calls = 0
     for name, modules_fused in fused_linears.items():
         if re.search(r"experts?\.\d+", name):
             expert_id = 0
@@ -422,7 +438,11 @@ def requantize_resmooth_fused_llm_layers(model: torch.nn.Module):
                 with fsdp2_aware_weight_update(model, new_expert_modules):
                     preprocess_linear_fusion(new_expert_modules)
 
+                _expert_loop_calls += 1
+                if _expert_loop_calls % 100 == 0:
+                    _qty_rs(f"expert-loop call {_expert_loop_calls}")
                 expert_id += 1
+    _qty_rs(f"expert-loop done; total fsdp2_aware calls={_expert_loop_calls}")
 
 
 def _export_quantized_weight(
