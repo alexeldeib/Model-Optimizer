@@ -207,12 +207,9 @@ delta script exits non-zero so a CI gate can catch a backslide.
 
 ## Phase 3: K2.6 multinode FSDP2 PTQ (2026-04-26)
 
-`job-gb200-k26-multinode-ptq.yaml` is the v2 of the single-node OOM
-case from 2026-04-25: same launcher target + recipe + source PVC,
-but spread over 4 GB200 nodes (16 GPUs, ~3 TB HBM total) via Indexed
-Job + headless service rendezvous.  Each rank's peak FSDP2-wrap
-memory is `model_size / world_size + layerwise_overhead`, well under
-the 184 GiB / GB200 budget.
+`job-gb200-k26-multinode-ptq.yaml` spreads K2.6 over 4 GB200 nodes
+(16 GPUs, ~3 TB HBM total) via Indexed Job + headless service +
+torchrun static rendezvous.
 
 ### Why Indexed Job (not MPIJob / KubeRay / PyTorchJob)
 
@@ -229,6 +226,55 @@ Headless Service uses `publishNotReadyAddresses: true` so worker
 pods can DNS-resolve `quanty-gb200-k26-mn-ptq-0.<svc>` before any
 pod becomes Ready -- otherwise rendezvous deadlocks.
 
+### Static rendezvous (commit 9676852f9)
+
+First multinode attempt used dynamic c10d rendezvous and timed out:
+the launcher's `RDZV_ID="${RDZV_ID:-quanty-k26-mn-${RANDOM}}"`
+evaluated independently in each pod's shell, so all 4 ranks landed
+in different rdzv groups.  Switched to static rendezvous
+(`--master-addr` / `--master-port` / `--node-rank`) -- with
+Indexed Jobs we already have unambiguous node ranks, so there is
+nothing for a separate rdzv ID to coordinate.
+
+### 16x GB200 OOM finding (2026-04-26)
+
+After static rendezvous landed, all 4 pods rendezvoused, all 16
+ranks loaded all 64 BF16 shards across 4 nodes, then OOMed at
+the *load* boundary (before FSDP2 wrap got control):
+
+    [rank0..15]: torch.OutOfMemoryError: CUDA out of memory.
+    Tried to allocate 28.00 MiB. GPU 0 has a total capacity of
+    184.31 GiB of which 9.50 MiB is free. ... 183.58 GiB is
+    allocated by PyTorch, ...
+
+This refines the strategy doc's earlier diagnosis: the OOM is
+**at load, not at FSDP2 wrap**.  Each pod's `from_pretrained`
+materializes the full 1.04T-param model into its own 4-GPU HBM
+(~736 GiB / pod) before FSDP2 has a chance to shard cross-node;
+2 TB BF16 doesn't fit in 736 GiB.
+
+### Path forward (next iteration)
+
+* **`init_empty_weights() + load_checkpoint_and_dispatch`** (the
+  accelerate pattern) is the right fix.  `init_empty_weights()`
+  builds the model with meta-tensors (no storage), then
+  `load_checkpoint_and_dispatch(device_map=<global_world_map>)`
+  loads each shard directly into its FSDP2-target rank.  No
+  rank ever holds the full model.  This is a ~30-50 LOC patch
+  to `examples/llm_ptq/multinode_ptq.py`'s load section --
+  belongs as an upstream PR if it pans out, complementing the
+  two already-pushed (VLM decoder discovery, distributed-
+  layerwise-checkpoint).
+* **Adopt team's INT4 source + accelerate dequant patches** is
+  the mature fallback (the team's `k26-quantize-megatron-worker-*`
+  uses NeMo+Megatron and `k26-quantize-nvfp4-llmc-*` uses
+  modelopt+INT4).  Keeps cluster precedent but departs from our
+  goal of upstream-clean fixes.
+* **Defer K2.6 multinode**, ship Phase 2 deliverables (both
+  upstream commits validated end-to-end on Qwen3-MoE; regression
+  gate passes within 2-sigma noise band).  Acceptable if the
+  init_empty_weights work is bigger than the project budget.
+
 ### Risks tracked
 
 * **Concurrent writers to scratch dir**: rank 0 owns the `cp -f` +
@@ -238,6 +284,9 @@ pod becomes Ready -- otherwise rendezvous deadlocks.
 * **Backoff**: `backoffLimit: 8` so a single-node preemption + resume
   costs only the in-flight layer's GPTQ work (resume from
   `manifest.json`).
+* **GB200 capacity contention**: 16 nodes total, frequently 14-16
+  consumed by team workloads; 4-node multinode Job blocks until
+  capacity churns.  Cluster autoscaler is at quota max.
 
 ## Ground rules
 
