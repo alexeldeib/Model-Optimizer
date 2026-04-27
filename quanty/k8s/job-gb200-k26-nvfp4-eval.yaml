@@ -1,0 +1,205 @@
+---
+# K2.6 NVFP4 absolute-quality eval against the export produced by the
+# multinode PTQ pipeline (commits d8b415ae2..19db81a1d).
+#
+# Standalone single-node eval -- this run produces the *absolute* lm-eval
+# scores for our K2.6 NVFP4 export.  A proper "<1% degradation"
+# regression gate against the K2.6 BF16 baseline is a separate Job
+# (needs ~4 GB200 nodes for the 2 TB BF16 model); split out so we can
+# answer "did NVFP4 produce something usable?" before committing the
+# 4-node BF16 cluster time.
+#
+# Tasks: gsm8k (math reasoning, most quantization-sensitive), mmlu
+# (broad knowledge, primary NVIDIA-published comparison axis),
+# arc_challenge (commonsense), hellaswag (subsampled).
+#
+# Why vLLM + FlashInfer NVFP4 MoE: this is the same path the production
+# c2-moonshotai-kimi-k25 deployment uses to serve K2.5 NVFP4 (image
+# docker.cloudsmith.io/coreweave/infr/vllm:v2.4.0).  K2.6 shares the
+# same outer KimiK25ForConditionalGeneration wrapper + DeepseekV3
+# inner backbone, so the same kernels apply.
+#
+# Source: /work/quanty/exports/k26-nvfp4-mn on the k26-nvfp4-ckpt PVC
+# (also at s3://infr/test/ace/quants/k26-nvfp4-experts-only).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: quanty-gb200-k26-nvfp4-eval
+  namespace: ace-inference
+  labels:
+    app: quanty-gb200-k26-nvfp4-eval
+    workstream: k26-nvfp4-quality-eval
+    owner: aeldeib
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels:
+        app: quanty-gb200-k26-nvfp4-eval
+        owner: aeldeib
+    spec:
+      restartPolicy: Never
+      schedulerName: binpack-scheduler
+      priorityClassName: inference-partial-node
+      imagePullSecrets:
+        - name: inference-backends-image-pull-secret
+        - name: cloudsmith-pull-secret
+      nodeSelector:
+        node.coreweave.cloud/type: gb200-4x-l
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      volumes:
+        - name: ckpt
+          persistentVolumeClaim:
+            claimName: k26-nvfp4-ckpt
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+      containers:
+        - name: harness
+          # Same vLLM image c2-moonshotai-kimi-k25 uses to serve K2.5
+          # NVFP4 in production.  Known-working FlashInfer NVFP4 MoE
+          # on Blackwell + DeepseekV3-style MLA attention.
+          image: docker.cloudsmith.io/coreweave/infr/vllm:v2.4.0
+          imagePullPolicy: IfNotPresent
+          workingDir: /work
+          env:
+            - name: HF_HOME
+              value: /work/hf-cache
+            - name: TRANSFORMERS_CACHE
+              value: /work/hf-cache
+            - name: HF_HUB_ENABLE_HF_TRANSFER
+              value: "1"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: k26-hf-secret
+                  key: HF_TOKEN
+                  optional: true
+            # NVFP4 MoE serving on Blackwell (matches K2.5 production).
+            - name: VLLM_USE_FLASHINFER_MOE_FP4
+              value: "1"
+            - name: VLLM_FLASHINFER_MOE_BACKEND
+              value: throughput
+            - name: NCCL_DEBUG
+              value: "WARN"
+            - name: EVAL_TASKS
+              value: "gsm8k,arc_challenge,hellaswag,mmlu"
+            # 500 samples per task: sufficient stderr for the absolute-
+            # score reporting; the proper regression gate vs BF16 will
+            # use limit=0 (full) once that baseline lands.
+            - name: EVAL_LIMIT
+              value: "500"
+            - name: EVAL_BATCH_SIZE
+              value: "auto"
+          resources:
+            limits:
+              nvidia.com/gpu: 4
+              memory: 700Gi
+              cpu: 64
+            requests:
+              nvidia.com/gpu: 4
+              memory: 600Gi
+              cpu: 48
+          volumeMounts:
+            - name: ckpt
+              mountPath: /work
+            - name: shm
+              mountPath: /dev/shm
+          command:
+            - bash
+            - -lc
+            - |
+              set -euo pipefail
+
+              # ``lm-eval[vllm]`` historically pulled ray as a hard dep
+              # but recent versions (>=0.4.7) split that out, so the
+              # vllm backend's ``import ray`` fails at runtime even
+              # though the package "installed".  Install ray explicitly
+              # to skip past the diagnostic-only ImportError.
+              if ! python -c "import lm_eval, ray" >/dev/null 2>&1; then
+                  echo ">>> installing lm-eval-harness + ray"
+                  pip install --quiet "lm-eval[vllm]>=0.4.5" "ray>=2.40,<3"
+              fi
+
+              EXPORTS_DIR="/work/quanty/exports"
+              SUMMARY="${EXPORTS_DIR}/k26-nvfp4-mn-eval-summary.json"
+              MODEL_PATH="${EXPORTS_DIR}/k26-nvfp4-mn"
+              OUT_DIR="${EXPORTS_DIR}/k26-nvfp4-mn/eval-results"
+              mkdir -p "${OUT_DIR}"
+
+              # tensor_parallel_size=4 -> single GB200 node (4 GPUs); K2.6
+              # NVFP4 is ~554 GiB packed which fits ~138 GiB/rank with
+              # margin under the 184 GiB ceiling.  gpu_memory_utilization
+              # set high because the model dominates HBM and KV is small
+              # at max_model_len=4096.
+              VLLM_BASE_ARGS="tensor_parallel_size=4,gpu_memory_utilization=0.92,max_model_len=4096,trust_remote_code=True,enforce_eager=False"
+
+              if [ "${EVAL_LIMIT}" = "0" ] || [ -z "${EVAL_LIMIT}" ]; then
+                  LIMIT_ARG=""
+              else
+                  LIMIT_ARG="--limit ${EVAL_LIMIT}"
+              fi
+
+              # Idempotency on retry.
+              if compgen -G "${OUT_DIR}/**/results_*.json" >/dev/null 2>&1 \
+                  || compgen -G "${OUT_DIR}/results_*.json" >/dev/null 2>&1; then
+                  echo "lm-eval :: k26-nvfp4-mn -- existing results found, skipping eval"
+              else
+                  echo
+                  echo "================================================================"
+                  echo "lm-eval :: k26-nvfp4-mn"
+                  echo "  pretrained=${MODEL_PATH}"
+                  echo "  tasks=${EVAL_TASKS}  limit=${EVAL_LIMIT}"
+                  echo "================================================================"
+                  lm_eval \
+                      --model vllm \
+                      --model_args "pretrained=${MODEL_PATH},${VLLM_BASE_ARGS}" \
+                      --tasks "${EVAL_TASKS}" \
+                      --batch_size "${EVAL_BATCH_SIZE}" \
+                      ${LIMIT_ARG} \
+                      --output_path "${OUT_DIR}" \
+                      --log_samples \
+                      2>&1 | tee "${OUT_DIR}/run.log"
+              fi
+
+              # Distill the per-task headline numbers into a single
+              # summary json for quick consumption (no regression gate
+              # in this Job -- pure absolute score reporting).
+              python <<'PY' | tee "${SUMMARY}"
+              import glob, json, os, sys
+
+              EXPORTS = "/work/quanty/exports"
+              LABEL = "k26-nvfp4-mn"
+              METRIC_KEYS = ("acc,none", "exact_match,strict-match",
+                             "exact_match,flexible-extract", "acc_norm,none")
+
+              pattern = f"{EXPORTS}/{LABEL}/eval-results/**/results_*.json"
+              paths = sorted(glob.glob(pattern, recursive=True))
+              if not paths:
+                  print(json.dumps({"error": f"no results json under {pattern}"}, indent=2))
+                  sys.exit(1)
+              with open(paths[-1]) as f:
+                  results = json.load(f)["results"]
+
+              report = {"model": LABEL, "source": paths[-1], "tasks": {}}
+              for task, metrics in results.items():
+                  for key in METRIC_KEYS:
+                      if key in metrics:
+                          name, suffix = key.split(",", 1)
+                          stderr = metrics.get(f"{name}_stderr,{suffix}", 0.0)
+                          report["tasks"][task] = {
+                              "metric": key,
+                              "score": float(metrics[key]),
+                              "stderr": float(stderr),
+                              "score_pct": float(metrics[key]) * 100,
+                          }
+                          break
+              print(json.dumps(report, indent=2))
+              PY
