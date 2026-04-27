@@ -34,17 +34,19 @@ quantize:
     # Switched from gptq -> max for K2.6 multinode validation.  GPTQ's
     # multi-replay Hessian collection re-triggers the transformers 5.x
     # DynamicCache cache-replay shape mismatch we first hit on Qwen2.5
-    # in Phase 0 ("attention mask should be of size (B,1,Q,2*K), but is
-    # (B,1,Q,K)") despite ``model.config.use_cache = False``: K2.6's
-    # custom modeling code grows KV state inside FlashAttention-2's
-    # forward regardless of the config flag.  Max-calibrate runs a
-    # single forward per layer so the cache never mutates.  GPTQ stays
-    # as a follow-up once the cache reset in modelopt's
-    # layerwise_calibrate covers in-place DynamicCache mutation
-    # (Phase 1 follow-up tracked in quanty_strategy.md).
+    # in Phase 0 (now fixed via cache-strip in modelopt's
+    # layerwise_calib.py).  Max is faster and good enough for the
+    # first end-to-end validation; GPTQ stays as a follow-up.
+    #
+    # ``layerwise_checkpoint_dir`` intentionally omitted: each K2.6
+    # layer's input activations + cached state is ~30 GiB; 61 layers
+    # = ~1.8 TiB which exceeds the 1.5 TiB k26-nvfp4-ckpt PVC.  No
+    # resume capability for now -- calibration runs straight through
+    # in one shot.  If we need resume for K2.6 we'll need either a
+    # bigger PVC or a checkpoint format that drops the activations
+    # and only keeps the per-layer quantizer state.
     method: max
     layerwise: true
-    layerwise_checkpoint_dir: /work/quanty/checkpoints/k26-nvfp4-experts-only
   quant_cfg:
     # 1) Disable everything by default.  Selectors below opt-in.
     - quantizer_name: '*'
