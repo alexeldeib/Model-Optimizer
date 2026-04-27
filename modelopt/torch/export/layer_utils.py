@@ -1017,6 +1017,7 @@ def set_expert_quantizer_amax(
     quantizer_attrs: str | list[str] | None = None,
     fallback_value: float = 0.5,
     device: torch.device | None = None,
+    root_model: nn.Module | None = None,
 ) -> list[nn.Module]:
     """Set amax values for expert quantizers using smart fallback logic.
 
@@ -1036,6 +1037,13 @@ def set_expert_quantizer_amax(
             If None, defaults to ["input_quantizer"] for backward compatibility.
         fallback_value: Final fallback value when other methods fail (default: 0.5)
         device: Target device for tensors (auto-detected if None)
+        root_model: When ``modules`` are members of an FSDPModule-wrapped
+            model, pass the root model so the per-expert weight-statistics
+            fallback can read unsharded weights via
+            ``fsdp2_aware_weight_update``.  Without this, ``module.weight``
+            returns the per-rank shard which gives nearly-identical
+            max-abs across MoE experts (same shard pattern + similar
+            trained-weight magnitudes), defeating the per-expert fallback.
 
     Returns:
         uncalibrated_modules: a list of uncalibrated experts
@@ -1152,13 +1160,69 @@ def set_expert_quantizer_amax(
     # in this batch, fall back to a default ratio of 1.0 (activation amax
     # ~ weight max-abs after LayerNorm in trained transformers, observed
     # to be a reasonable order-of-magnitude estimate).
-    def _per_module_weight_max_abs(module: nn.Module) -> float | None:
+    #
+    # FSDP2 subtlety: when ``modules`` come from an FSDPModule-wrapped
+    # model, ``module.weight`` returns the per-rank shard, NOT the global
+    # tensor.  Sharded local views give nearly-identical max-abs across
+    # K2.6's 384 experts (same shard pattern + similar trained-weight
+    # magnitudes after training), defeating the per-expert fallback --
+    # uniform input_scale across experts is exactly the broken-broadcast
+    # behaviour we're trying to fix.  Cache weight_max_abs *inside* an
+    # ``fsdp2_aware_weight_update`` context (which all-gathers the
+    # shard), so the values reflect the true global tensor.  Caller
+    # must pass ``root_model`` for this to work; without it we fall
+    # back to the sharded-view behaviour and warn.
+    from modelopt.torch.quantization.utils import fsdp2_aware_weight_update
+
+    _weight_max_abs_cache: dict[int, float] = {}
+
+    def _read_weight_max_abs_locked(module: nn.Module) -> float | None:
+        """Read weight max-abs from the LIVE module.weight tensor.
+
+        Caller must guarantee the weight is unsharded (via
+        ``fsdp2_aware_weight_update``) when the module is FSDP-wrapped.
+        """
         for weight_attr in ("weight", "gate_up_proj", "down_proj"):
             if hasattr(module, weight_attr):
                 w = getattr(module, weight_attr)
                 if w is not None and w.numel() > 0:
                     return float(torch.max(torch.abs(w)).item())
         return None
+
+    def _populate_weight_max_abs_cache(modules_to_read: list[nn.Module]) -> None:
+        """Populate the cache by reading each module's weight under the
+        appropriate FSDP unshard context.
+
+        For non-FSDP models, ``fsdp2_aware_weight_update`` is a no-op
+        wrapper; the cache is populated directly.
+        """
+        if root_model is None:
+            for module in modules_to_read:
+                key = id(module)
+                if key in _weight_max_abs_cache:
+                    continue
+                val = _read_weight_max_abs_locked(module)
+                if val is not None:
+                    _weight_max_abs_cache[key] = val
+            return
+        # All modules in a single ``set_expert_quantizer_amax`` call are
+        # siblings within the same FSDPModule (typically all gate_proj
+        # of one MoE block, or all up_proj, etc.), so a single
+        # ``fsdp2_aware_weight_update`` covers the whole batch.
+        with fsdp2_aware_weight_update(root_model, modules_to_read, reshard=True):
+            for module in modules_to_read:
+                key = id(module)
+                if key in _weight_max_abs_cache:
+                    continue
+                val = _read_weight_max_abs_locked(module)
+                if val is not None:
+                    _weight_max_abs_cache[key] = val
+
+    # Read weights ONCE under unshard, cache for the rest of the function.
+    _populate_weight_max_abs_cache(modules)
+
+    def _per_module_weight_max_abs(module: nn.Module) -> float | None:
+        return _weight_max_abs_cache.get(id(module))
 
     # Pre-compute the empirical amax/weight_max_abs ratio from any
     # calibrated input_quantizers in this batch.  Median rather than

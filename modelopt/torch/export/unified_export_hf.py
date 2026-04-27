@@ -826,11 +826,13 @@ def _process_quantized_modules(
                 set_expert_quantizer_amax(
                     modules=sub_module,
                     quantizer_attrs=["gate_up_proj_weight_quantizer", "down_proj_weight_quantizer"],
+                    root_model=model,
                 )
                 # Handle input quantizers amax values using smart fallback logic
                 set_expert_quantizer_amax(
                     modules=sub_module,
                     quantizer_attrs=["gate_up_proj_input_quantizer", "down_proj_input_quantizer"],
+                    root_model=model,
                 )
                 # Export the quantized weights
                 with fsdp2_aware_weight_update(model, sub_module, reshard=False):
@@ -898,6 +900,7 @@ def _export_transformers_checkpoint(
                             set_expert_quantizer_amax(
                                 modules=list(linear_modulelist),
                                 quantizer_attrs=["input_quantizer"],
+                                root_model=model,
                             )
                 elif hasattr(sub_module.experts, "gate_up_proj_weight_quantizers"):
                     # _QuantFusedExperts: amax fallback is handled in _export_fused_experts
@@ -913,6 +916,7 @@ def _export_transformers_checkpoint(
                                 set_expert_quantizer_amax(
                                     modules=[linear_module],
                                     quantizer_attrs=["input_quantizer"],
+                                    root_model=model,
                                 )
                 elif isinstance(sub_module.experts, collections.abc.Iterable):
                     # For other MoE models (like Mixtral) with iterable experts
@@ -920,6 +924,7 @@ def _export_transformers_checkpoint(
                         set_expert_quantizer_amax(
                             modules=[getattr(expert, linear_name) for expert in sub_module.experts],
                             quantizer_attrs=["input_quantizer"],
+                            root_model=model,
                         )
                     except AttributeError as e:
                         # Provide more helpful debugging information
