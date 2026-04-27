@@ -313,8 +313,19 @@ def _fuse_shared_input_modules(
     return fused_linears
 
 
+@torch.no_grad()
 def requantize_resmooth_fused_llm_layers(model: torch.nn.Module):
-    """Group modules that take the same input and register shared parameters in module."""
+    """Group modules that take the same input and register shared parameters in module.
+
+    Wrapped in ``@torch.no_grad`` because the dummy forward this function
+    runs through ``llm_dummy_forward()`` would otherwise retain every
+    intermediate activation for autograd.  At trillion-parameter scale
+    (Kimi K2.6) the per-rank activation footprint pushes a 4x GB200
+    pod over its 184 GiB HBM budget mid-export -- observed as OOM
+    "Tried to allocate 28.00 MiB" with 181 GiB already in use, all
+    activations.  Inference-only autograd is never needed for this
+    fusion analysis.
+    """
     # TODO: Handle DBRX MoE
     quantization_format = get_quantization_format(model)
     model_type = type(model).__name__.lower()
