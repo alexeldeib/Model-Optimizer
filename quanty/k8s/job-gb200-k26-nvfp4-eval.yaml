@@ -98,6 +98,16 @@ spec:
               value: "500"
             - name: EVAL_BATCH_SIZE
               value: "auto"
+            # The first run produced random-chance scores across all
+            # tasks (gsm8k=0%, mmlu=25.5%, etc) because K2.6 is
+            # instruction-tuned and the raw lm-eval prompts skipped
+            # the chat template entirely.  The export ships the
+            # chat template via ``chat_template.jinja`` (separate
+            # file from tokenizer_config.json).  Set FORCE_RERUN=1
+            # to wipe the stale random-score results and regenerate
+            # with --apply_chat_template + --fewshot_as_multiturn.
+            - name: FORCE_RERUN
+              value: "1"
           resources:
             limits:
               nvidia.com/gpu: 4
@@ -148,6 +158,13 @@ spec:
               fi
 
               # Idempotency on retry.
+              # Force-clear stale results from the previous run (we
+               # need to re-run with apply_chat_template).  Keep the
+               # idempotency guard for normal Job retries.
+              if [ "${FORCE_RERUN:-0}" = "1" ]; then
+                  echo "FORCE_RERUN=1: wiping ${OUT_DIR} so this Job runs fresh"
+                  rm -rf "${OUT_DIR}"/*
+              fi
               if compgen -G "${OUT_DIR}/**/results_*.json" >/dev/null 2>&1 \
                   || compgen -G "${OUT_DIR}/results_*.json" >/dev/null 2>&1; then
                   echo "lm-eval :: k26-nvfp4-mn -- existing results found, skipping eval"
@@ -157,12 +174,16 @@ spec:
                   echo "lm-eval :: k26-nvfp4-mn"
                   echo "  pretrained=${MODEL_PATH}"
                   echo "  tasks=${EVAL_TASKS}  limit=${EVAL_LIMIT}"
+                  echo "  apply_chat_template=true (K2.6 is instruction-tuned;"
+                  echo "    raw prompts produce garbage scores)"
                   echo "================================================================"
                   lm_eval \
                       --model vllm \
                       --model_args "pretrained=${MODEL_PATH},${VLLM_BASE_ARGS}" \
                       --tasks "${EVAL_TASKS}" \
                       --batch_size "${EVAL_BATCH_SIZE}" \
+                      --apply_chat_template \
+                      --fewshot_as_multiturn \
                       ${LIMIT_ARG} \
                       --output_path "${OUT_DIR}" \
                       --log_samples \
