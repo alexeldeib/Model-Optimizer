@@ -886,6 +886,12 @@ def fsdp2_aware_weight_update(root_model, modules_to_update, reshard=True):
     """
     name_to_module: dict[str, nn.Module] | None = None
     id_to_name: dict[int, str] | None = None
+    # Initialise upfront so the ``finally`` block's ``if name not in
+    # fsdp_param_mapping`` check survives an exception (most commonly
+    # an OOM) raised inside ``root_module.unshard()`` below -- without
+    # this, the secondary ``UnboundLocalError`` masks the original
+    # exception and obscures the failure root cause in tracebacks.
+    fsdp_param_mapping: dict[str, "FSDPParam"] = {}
     try:
         if isinstance(root_model, FSDPModule):
             # Get FSDP root module, if none is returned, then the update is not made to a submodule of an FSDPModule
