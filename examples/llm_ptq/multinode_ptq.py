@@ -756,6 +756,70 @@ def main(args):
                     f"Copied {len(copied)} auxiliary file(s) from source: "
                     + ", ".join(sorted(copied))
                 )
+
+        # Scrub serving-time landmines that the source's HF artifacts +
+        # transformers' save_pretrained leave behind:
+        #
+        # 1. ``preprocessor_config.json`` shipped from the source (Kimi
+        #    K2.x and similar HF mirrors) often carries a top-level
+        #    ``"revision": "main"`` field plus transformers-internal
+        #    flags (``_from_auto``, ``cache_dir``, ``force_download``,
+        #    ``local_files_only``).  When transformers loads the
+        #    processor at serving time, it does
+        #    ``cls(**config_dict, revision=revision)`` -- with
+        #    ``"revision"`` already in ``config_dict`` from the JSON,
+        #    Python rejects the call with
+        #    ``TypeError: got multiple values for keyword argument
+        #    'revision'`` and vLLM's first PutObject blows up before
+        #    any inference can run.  Symptom seen 2026-04-27:
+        #
+        #      TypeError: transformers_modules.k26.kimi_k25_vision_processing.
+        #      KimiK25VisionProcessor() got multiple values for keyword
+        #      argument 'revision'
+        #
+        # 2. ``config.json``'s ``auto_map`` accumulates an
+        #    ``AutoModelForCausalLM`` entry pointing at the FSDP wrapper
+        #    class (e.g. ``_fully_shard.FSDPKimiK25ForConditionalGeneration``)
+        #    because ``model.save_pretrained`` walks the wrapped MRO and
+        #    records the FSDP wrapper as the canonical model class.
+        #    Downstream loaders that respect ``auto_map`` then try to
+        #    import a module that lives in PyTorch internals, which is
+        #    why commit 19db81a1d had to strip the stray ``_fsdp_*.py``
+        #    files from the export dir.  Strip the auto_map entry too so
+        #    consumers fall back to the model_type-based resolver.
+        import json as _json
+
+        ppath = dst_root / "preprocessor_config.json"
+        if ppath.exists():
+            with ppath.open() as f:
+                pp = _json.load(f)
+            scrubbed_pp = []
+            for k in ("revision", "_from_auto", "cache_dir",
+                      "force_download", "local_files_only"):
+                if pp.pop(k, None) is not None:
+                    scrubbed_pp.append(k)
+            if scrubbed_pp:
+                with ppath.open("w") as f:
+                    _json.dump(pp, f, indent=2)
+                print(
+                    f"Scrubbed transformers-internal flags from "
+                    f"preprocessor_config.json: {', '.join(scrubbed_pp)}"
+                )
+
+        cpath = dst_root / "config.json"
+        if cpath.exists():
+            with cpath.open() as f:
+                cc = _json.load(f)
+            am = cc.get("auto_map", {})
+            stray = am.pop("AutoModelForCausalLM", None)
+            if stray and "_fully_shard" in str(stray):
+                cc["auto_map"] = am
+                with cpath.open("w") as f:
+                    _json.dump(cc, f, indent=4)
+                print(
+                    f"Stripped FSDP-wrapper auto_map from config.json: "
+                    f"AutoModelForCausalLM={stray!r}"
+                )
         # Export the model
         print(f"Export completed in {elapsed:.2f}s")
         print(f"Model exported to {args.export_path}")
