@@ -102,6 +102,16 @@ spec:
           env:
             - name: NCCL_DEBUG
               value: "WARN"
+            # K2.6 export hit OOM at 181/184 GiB with 28 MiB asks
+            # because of fragmentation -- modelopt's per-quantized-
+            # linear unshard/reshard cycles leave the cuda allocator
+            # with many small free blocks but no contiguous space.
+            # ``expandable_segments:True`` (the error message itself
+            # recommends this) lets the allocator coalesce free space
+            # via VMM-style segment growth instead of failing on
+            # contiguity.  Negligible runtime overhead.
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: "expandable_segments:True"
             - name: NCCL_ASYNC_ERROR_HANDLING
               value: "1"
             - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
