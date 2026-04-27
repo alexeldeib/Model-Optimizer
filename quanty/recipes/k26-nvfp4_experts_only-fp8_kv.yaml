@@ -56,7 +56,7 @@ quantize:
       cfg:
         block_sizes:
           -1: 16
-          type: static
+          type: dynamic
           scale_bits: e4m3
         num_bits: e2m1
     - quantizer_name: '*mlp.experts.*input_quantizer'
