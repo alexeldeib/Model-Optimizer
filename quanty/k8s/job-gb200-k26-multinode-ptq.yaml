@@ -1,25 +1,19 @@
 ---
-# K2.6 NVFP4 multinode PTQ on 7x GB200 nodes (28 GPUs, ~5.2 TB HBM total).
+# K2.6 NVFP4 multinode PTQ on 6x GB200 nodes (24 GPUs, ~4.4 TB HBM total).
 #
-# Scaled from 4 nodes to 7 to put headroom under the export step.
-# At 4 nodes, per-rank shard = 1.04T / 16 ranks = 130 GiB resident
-# weights; the export's per-decoder-layer unshard adds ~17B params
-# x 2 bytes = ~34 GiB on top, plus calibration buffers + the
-# BF16->NVFP4 weight conversion buffer in _export_quantized_weight,
-# pushing peak to 181 GiB on a 184 GiB GB200.  The dummy_forward
-# OOM in requantize_resmooth_fused_llm_layers is gone (commits
-# d8b415ae2 + 227302817), but the per-module unshard loop in
-# _process_quantized_modules then hits the same wall.  Bumping
-# world_size to 28 cuts the resident shard to 1.04T / 28 = ~74 GiB,
-# leaves ~17 GiB unshard delta per layer, and ~17 GiB buffers ->
-# peak ~108 GiB vs. 184 GiB ceiling.  Cluster has 7 unbooked GB200
-# nodes (the other 9 are running k26-int4 / c2-k25-bench /
-# kimi-k25 serving / deepseek-v4-pro / etc.); 8 nodes won't
-# schedule, 7 fits exactly.  ~76 GiB margin per rank.
+# 4-node attempt (2026-04-27) confirmed OOM at 181/184 GiB during
+# _process_quantized_modules even with the per-expert input_scale fix
+# in commit 543273c2b (the fix targets quality, not memory).  Diagnostic
+# prints from commit 4ca081b9f showed entry at allocated=125.8 GiB peak=
+# 166.0 GiB -- 55 GiB headroom for the conversion + state_dict gather
+# segment that needs ~55 GiB.  Doesn't fit at 4-node.
+#
+# 6-node halves per-rank shard from 130 -> 87 GiB, frees ~43 GiB peak,
+# brings the export segment well under the ceiling.
 #
 # Topology:
-#   * Indexed Job, parallelism=completions=7 -> pods 0..6
-#   * Each pod gets 4x GB200 GPUs (28 GPUs total)
+#   * Indexed Job, parallelism=completions=6 -> pods 0..5
+#   * Each pod gets 4x GB200 GPUs (24 GPUs total)
 #   * Pod-0 is torchrun rendezvous master, reachable via the headless
 #     service DNS as quanty-gb200-k26-mn-ptq-0.<svc>:29500
 #   * Layerwise checkpoint dir on shared PVC means a preempted pod
@@ -62,8 +56,8 @@ spec:
   # (0..parallelism-1).  k8s 1.27+ also auto-sets hostname to
   # <job-name>-<index>, so workers reach pod-0 via DNS without an
   # init-container peek.
-  parallelism: 7
-  completions: 7
+  parallelism: 6
+  completions: 6
   completionMode: Indexed
   # 8 = ~2 retries per pod.  The layerwise checkpoint resume picks up
   # from the last fully-written layer so a single-node failure costs
@@ -102,6 +96,15 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 256Gi
+        # Runtime overlay of commit 6d25cbe635 (FSDP-aware
+        # set_expert_quantizer_amax: reads weights inside an
+        # fsdp2_aware_weight_update context so per-expert weight
+        # max-abs is meaningful, not the per-rank shard max).
+        # Avoids docker rebuild for the patched code; once we
+        # validate quality, bake into :dev.
+        - name: modelopt-patch
+          configMap:
+            name: modelopt-fsdp-fix-6d25cbe
       containers:
         - name: ptq
           image: docker.cloudsmith.io/coreweave/infr-dev/quanty-modelopt:dev
@@ -156,7 +159,7 @@ spec:
             - name: NUM_GPUS
               value: "4"
             - name: NNODES
-              value: "7"
+              value: "6"
             - name: MASTER_ADDR
               value: "quanty-gb200-k26-mn-ptq-0.quanty-gb200-k26-mn-rdzv.ace-inference.svc.cluster.local"
             - name: MASTER_PORT
@@ -174,10 +177,26 @@ spec:
               value: /work/quanty/exports/k26-nvfp4-mn
             - name: CALIB_DATASET
               value: nemotron-post-training-dataset-v2
+            # With moe_calib_experts_ratio=1.0 enabled in the recipe,
+            # calibration forwards every token through ALL 384 experts
+            # (top_k=384 instead of deployment's top_k=8).  The output
+            # concatenation in DeepseekV3MoE.moe_infer scales linearly with
+            # top_k, so cat(outputs, ...) at BATCH=8 SEQ_LEN=2048 needs
+            # 8 * 2048 * 384 * 7168 * 2 bytes = 88 GiB on top of the
+            # 168 GiB resident model state -- OOMs at 21 GiB allocation
+            # request.
+            #
+            # Cut BATCH to 1 to bring the cat tensor down to ~11 GiB
+            # (8x reduction from BATCH=8); SAMPLES from 2048 to 512
+            # because every-token-to-every-expert calibration already
+            # gives 4x more per-expert coverage than top_k=8 SAMPLES=2048
+            # (each expert sees 512 * 2048 = 1M tokens instead of
+            # 2048 * 2048 * 8 / 384 = 87k tokens), so reducing samples
+            # doesn't lose statistical power.
             - name: CALIB_SAMPLES
-              value: "2048"
+              value: "512"
             - name: CALIB_BATCH
-              value: "8"
+              value: "1"
             - name: CALIB_SEQ_LEN
               value: "2048"
             # ---- S3 upload of final export ----
@@ -232,6 +251,19 @@ spec:
               mountPath: /work
             - name: shm
               mountPath: /dev/shm
+            # Overlay the two patched modelopt source files via subPath
+            # so the rest of the modelopt package on the image is left
+            # alone.  K8s reads both at pod creation; if the ConfigMap
+            # changes mid-run, kubelet does NOT propagate the update --
+            # which is what we want here (avoids stale-during-export).
+            - name: modelopt-patch
+              mountPath: /opt/quanty/modelopt/torch/export/layer_utils.py
+              subPath: layer_utils.py
+              readOnly: true
+            - name: modelopt-patch
+              mountPath: /opt/quanty/modelopt/torch/export/unified_export_hf.py
+              subPath: unified_export_hf.py
+              readOnly: true
           command:
             - /usr/bin/tini
             - --
