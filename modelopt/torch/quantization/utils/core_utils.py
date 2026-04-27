@@ -886,6 +886,19 @@ def fsdp2_aware_weight_update(root_model, modules_to_update, reshard=True):
     """
     name_to_module: dict[str, nn.Module] | None = None
     id_to_name: dict[int, str] | None = None
+    # Initialise all locals referenced from the ``finally`` block upfront
+    # so an exception (most commonly OOM in ``root_module.unshard()``)
+    # raised mid-try doesn't surface as a secondary ``UnboundLocalError``
+    # that masks the original error.  Three vars are touched in finally:
+    #   * fsdp_param_mapping -- looked up per-parameter
+    #   * fsdp_param_group   -- has its ``fsdp_params`` list rewritten
+    #   * root_module        -- resharded if ``reshard=True``
+    # All three are only meaningfully assigned mid-try.  Guard the
+    # finally block's references with ``is not None`` so a partial
+    # initialisation falls through cleanly to the original exception.
+    fsdp_param_mapping: dict[str, "FSDPParam"] = {}
+    fsdp_param_group = None
+    root_module = None
     try:
         if isinstance(root_model, FSDPModule):
             # Get FSDP root module, if none is returned, then the update is not made to a submodule of an FSDPModule
@@ -1011,11 +1024,16 @@ def fsdp2_aware_weight_update(root_model, modules_to_update, reshard=True):
                         # Remove the post_load_hook_handle to allow gc to collect the old FSDPParam
                         old_fsdp_param._post_load_hook_handle.remove()
 
-            # Update FSDPParam list with new compressed weights
-            fsdp_param_group.fsdp_params = list(fsdp_param_mapping.values())
+            # Update FSDPParam list with new compressed weights -- only
+            # if the unshard above actually succeeded and we got far
+            # enough to assign ``fsdp_param_group``.  Otherwise we'd
+            # raise UnboundLocalError on top of the original (likely
+            # OOM) exception, masking it from the user.
+            if fsdp_param_group is not None:
+                fsdp_param_group.fsdp_params = list(fsdp_param_mapping.values())
 
-            # Reshard FSDP root module
-            if reshard:
+            # Reshard FSDP root module -- guarded the same way.
+            if reshard and root_module is not None:
                 with enable_fake_quant(root_module):
                     root_module.reshard()
 
