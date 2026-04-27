@@ -342,7 +342,37 @@ def _has_fusable_quant_state(model: torch.nn.Module) -> bool:
     The walk is O(n_modules), bounded by ~256k modules even for K2.6 -- a
     couple of seconds at worst, vs. the full dummy forward + per-layer
     unshard cycle it elides.
+
+    Dynamic-block subtlety: ``algorithm: max`` calibration unconditionally
+    accumulates a per-tensor ``amax`` during forward, *regardless* of
+    whether the quantizer's ``block_sizes.type`` is static or dynamic.
+    For static-block quant, that scalar amax becomes the per-tensor
+    scale's denominator and is read at inference -- fusion's
+    amax-unification across siblings matters.  For dynamic-block quant
+    (NVFP4 dynamic, MXFP4, MXFP8, etc.), the inference kernel computes
+    scales per-block from the input itself; the scalar amax is dead
+    calibration metadata that the kernel never reads.  Treating those
+    quantizers as fusable is the bug that the K2.6 OOM uncovered: the
+    dummy forward fires to drive a fusion pass whose only effect is to
+    overwrite a value nothing reads, while triggering the per-layer
+    unshard that pushes a 4xGB200 rank past 184 GiB.  Distinguishing
+    them via ``block_sizes.type == "dynamic"`` is sufficient.
     """
+
+    def _amax_is_inference_used(q) -> bool:
+        """True iff a scalar amax on ``q`` is read at inference time."""
+        if not getattr(q, "is_enabled", False):
+            return False
+        amax = getattr(q, "amax", None)
+        if amax is None or not hasattr(amax, "numel") or amax.numel() != 1:
+            return False
+        block_sizes = getattr(q, "block_sizes", None)
+        # Dynamic-block quantizers compute per-block scales at runtime;
+        # the scalar amax we collected during MAX calibration is unused.
+        if isinstance(block_sizes, dict) and block_sizes.get("type") == "dynamic":
+            return False
+        return True
+
     for module in model.modules():
         for quant_attr in ("input_quantizer", "weight_quantizer"):
             quantizer = getattr(module, quant_attr, None)
@@ -357,15 +387,11 @@ def _has_fusable_quant_state(model: torch.nn.Module) -> bool:
             # W4A8 INT4-AWQ + FP8 cascade); inspect each leg.
             if isinstance(quantizer, SequentialQuantizer):
                 for sub_q in quantizer:
-                    if getattr(sub_q, "is_enabled", False):
-                        amax = getattr(sub_q, "amax", None)
-                        if amax is not None and hasattr(amax, "numel") and amax.numel() == 1:
-                            return True
+                    if _amax_is_inference_used(sub_q):
+                        return True
                 continue
-            if getattr(quantizer, "is_enabled", False):
-                amax = getattr(quantizer, "amax", None)
-                if amax is not None and hasattr(amax, "numel") and amax.numel() == 1:
-                    return True
+            if _amax_is_inference_used(quantizer):
+                return True
     return False
 
 
