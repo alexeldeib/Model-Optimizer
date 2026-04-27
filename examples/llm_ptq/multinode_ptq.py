@@ -326,8 +326,22 @@ def load_and_prepare_model(
         model_dtype = getattr(torch, model_dtype, torch.bfloat16)
     with init_empty_weights():
         with patch_compressed_linear_loading():
+            # ``attn_implementation="eager"`` avoids FlashAttention-2's
+            # KV-cache mutation across forwards, which breaks modelopt's
+            # layerwise_calibrate replay path on transformers 5.x for
+            # custom attention modules.  K2.6's MLA expansion grows
+            # k_len from 512 -> 1024 between captures, raising
+            # "Attention mask should be of size (B,1,Q,2*K)..." despite
+            # ``model.config.use_cache = False``.  Eager attention is
+            # slower but doesn't carry KV state in a way the captured-
+            # then-replayed kwargs can't reset.  Calibration overhead
+            # is negligible vs. K2.6's compute footprint; serving still
+            # uses FA2 (the recipe doesn't quantize attention).
             model = AutoModelForCausalLM.from_config(
-                config, trust_remote_code=trust_remote_code, dtype=model_dtype
+                config,
+                trust_remote_code=trust_remote_code,
+                dtype=model_dtype,
+                attn_implementation="eager",
             )
 
     model.eval()
