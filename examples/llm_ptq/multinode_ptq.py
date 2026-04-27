@@ -694,6 +694,28 @@ def main(args):
         if tokenizer is not None:
             tokenizer.padding_side = default_padding_side
             tokenizer.save_pretrained(args.export_path)
+        # Multimodal models (KimiK25ForConditionalGeneration, Llava,
+        # Llama-4-VL, ...) ship a separate AutoProcessor with image/audio
+        # preprocessor configs; ``model.save_pretrained`` only saves the
+        # core model + ``hf_quant_config.json`` and does NOT propagate
+        # those.  Without ``preprocessor_config.json`` in the export dir
+        # vLLM's renderer fails at load time with:
+        #   OSError: Can't load image processor for '<export_dir>'
+        #   ... make sure '<export_dir>' is the correct path to a
+        #   directory containing a preprocessor_config.json file
+        # Save the processor explicitly when the source model has one.
+        try:
+            from transformers import AutoProcessor
+
+            processor = AutoProcessor.from_pretrained(
+                args.pyt_ckpt_path, trust_remote_code=args.trust_remote_code
+            )
+            processor.save_pretrained(args.export_path)
+            print(f"Processor saved to {args.export_path}")
+        except (ValueError, OSError, EnvironmentError) as e:
+            # Text-only models don't have an AutoProcessor entry;
+            # this is benign in that case.
+            print(f"No AutoProcessor for {args.pyt_ckpt_path} (text-only?): {e}")
         # Export the model
         print(f"Export completed in {elapsed:.2f}s")
         print(f"Model exported to {args.export_path}")
