@@ -723,6 +723,18 @@ def _export_transformers_checkpoint(
 
     accelerator = kwargs.get("accelerator")
 
+    # Build the named_modules / id_to_name index ONCE for the duration
+    # of the export.  Every call into ``fsdp2_aware_weight_update``
+    # below (per quantized linear) would otherwise rebuild that
+    # dict (O(n_modules)), turning the export into an O(N * n_modules)
+    # walk that takes hours on MoE models.  ``fsdp_module_index_cache``
+    # stashes the index on ``model`` and ``fsdp2_aware_weight_update``
+    # picks it up via ``_FSDP_INDEX_CACHE_ATTR``.
+    from modelopt.torch.quantization.utils.core_utils import fsdp_module_index_cache
+
+    _index_cache_ctx = fsdp_module_index_cache(model)
+    _index_cache_ctx.__enter__()
+
     # Handle input quantizers of experts that are not calibrated
     for _, sub_module in model.named_modules():
         if is_moe(sub_module) and hasattr(sub_module, "experts"):
@@ -831,6 +843,9 @@ def _export_transformers_checkpoint(
         quantized_state_dict = accelerator.get_state_dict(model)
     else:
         quantized_state_dict = model.state_dict()
+
+    # Release the cached named_modules() index.
+    _index_cache_ctx.__exit__(None, None, None)
 
     # We define kv cache scale as amax / 448 for both FP8 and NVFP4 KV cache quantization.
     kv_cache_max_bound = 448
