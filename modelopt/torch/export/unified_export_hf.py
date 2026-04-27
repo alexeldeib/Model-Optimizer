@@ -17,6 +17,7 @@
 
 import collections.abc
 import json
+import logging
 import re
 import tempfile
 import warnings
@@ -27,6 +28,8 @@ from pathlib import Path
 from typing import Any
 
 import torch
+
+_logger = logging.getLogger(__name__)
 import torch.nn as nn
 from safetensors.torch import save_file
 
@@ -59,6 +62,7 @@ from modelopt.torch.quantization.nn import (
 )
 from modelopt.torch.quantization.qtensor import MXFP8QTensor, NVFP4QTensor
 from modelopt.torch.quantization.utils import fsdp2_aware_weight_update, quantizer_attr_names
+from modelopt.torch.utils.logging import print_rank_0
 
 try:
     from modelopt.torch.sparsity.attention_sparsity.conversion import export_sparse_attention_config
@@ -448,8 +452,25 @@ def requantize_resmooth_fused_llm_layers(model: torch.nn.Module):
     # docstring for the full rationale; the cheap O(n_modules) walk is the
     # only thing standing between dynamic-block NVFP4 recipes and a
     # trillion-parameter export OOM.
-    if not _has_fusable_quant_state(model):
+    needs_fusion = _has_fusable_quant_state(model)
+    if not needs_fusion:
+        # Diagnostic: this print is the only signal the user gets that
+        # the dummy_forward path got skipped vs. fired.  Without it, an
+        # OOM later in ``_process_quantized_modules`` looks identical to
+        # an OOM in this function -- making it impossible to tell from
+        # a traceback alone whether the fusion-path skip actually landed.
+        print_rank_0(
+            "requantize_resmooth_fused_llm_layers: no fusable quantizer state "
+            "(no pre_quant_scale, no static-block scalar amax) -- skipping "
+            "dummy_forward + collect_shared_input_modules + unactivated-expert "
+            f"fusion (quantization_format={quantization_format!r})"
+        )
         return
+    print_rank_0(
+        "requantize_resmooth_fused_llm_layers: fusable quantizer state present "
+        f"(quantization_format={quantization_format!r}) -- running dummy_forward "
+        "to collect shared-input groups"
+    )
 
     # Define the dummy forward function for LLM
     def llm_dummy_forward():
@@ -734,6 +755,18 @@ def _process_quantized_modules(
             If True, modules with base_layer attribute are skipped.
     """
     fsdp_module_to_reshard = None
+    # Diagnostic counter for the per-FSDPModule memory log below.
+    # Logging every transition is too noisy for trillion-param MoE
+    # (61+ decoder layers x several quant-affected children per layer);
+    # logging every 10th plus the first few captures both the "did the
+    # loop start cleanly?" question and the trailing peak-memory drift
+    # that precedes most export OOMs.  Emitted at DEBUG level via the
+    # module logger so production exports stay quiet by default; opt
+    # in with ``logging.getLogger("modelopt.torch.export").setLevel(
+    # logging.DEBUG)`` when investigating an export OOM.
+    _fsdp_module_idx = 0
+    _fsdp_log_first_n = 3
+    _fsdp_log_every = 10
 
     for name, sub_module in model.named_modules():
         # Optimization to perform resharding only once per decoder layer to avoid extra communication overhead
@@ -745,6 +778,38 @@ def _process_quantized_modules(
                 fsdp_module_to_reshard.reshard()
 
             fsdp_module_to_reshard = sub_module
+            # Memory diagnostic: peak HBM after the previous decoder
+            # layer's reshard returned its all-gather buffer.  This is
+            # the "valley" memory between layers; an OOM here means
+            # subsequent layer-unshard will not have headroom.  Most
+            # export OOMs hit on the first layer that breaches the
+            # budget; logging the trajectory makes the breach point
+            # obvious instead of buried in a 184 GiB / 28 MiB
+            # allocation traceback.  Logger.debug so production stays
+            # quiet; rank-0 gating happens at the dist layer.
+            if (
+                _logger.isEnabledFor(logging.DEBUG)
+                and torch.cuda.is_available()
+                and (
+                    _fsdp_module_idx < _fsdp_log_first_n
+                    or _fsdp_module_idx % _fsdp_log_every == 0
+                )
+                and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0)
+            ):
+                allocated_gib = torch.cuda.memory_allocated() / 1024**3
+                peak_gib = torch.cuda.max_memory_allocated() / 1024**3
+                free_b, _total_b = torch.cuda.mem_get_info()
+                free_gib = free_b / 1024**3
+                _logger.debug(
+                    "_process_quantized_modules: FSDPModule[%d] %r "
+                    "allocated=%.1f GiB peak=%.1f GiB free=%.1f GiB",
+                    _fsdp_module_idx,
+                    name,
+                    allocated_gib,
+                    peak_gib,
+                    free_gib,
+                )
+            _fsdp_module_idx += 1
 
         # We skip QuantLoraLinear module for modelopt QLoRA
         if is_modelopt_qlora and (hasattr(sub_module, "base_layer")):
