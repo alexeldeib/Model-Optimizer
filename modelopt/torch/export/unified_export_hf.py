@@ -313,6 +313,88 @@ def _fuse_shared_input_modules(
     return fused_linears
 
 
+def _has_fusable_quant_state(model: torch.nn.Module) -> bool:
+    """Return True iff any quantizer in ``model`` has state that
+    ``preprocess_linear_fusion`` would actually unify across siblings.
+
+    The fusion pass exists to do three things across modules that share an
+    activation (QKV-style or gate/up-style siblings):
+
+      1. Resmooth ``pre_quant_scale`` -- only set for the AWQ / SVDQUANT family.
+      2. Unify ``input_quantizer.amax`` -- only meaningful when amax is a
+         scalar (per-tensor static input quant).  Dynamic block-wise
+         formats (NVFP4 dynamic, MXFP4, MXFP8 without AWQ siblings) compute
+         scales at runtime and never store a scalar amax.
+      3. Unify ``weight_quantizer.amax`` -- same scalar-amax requirement.
+
+    For recipes whose quantizer state is *purely* dynamic-block (the typical
+    NVFP4 experts-only / FP8-KV mix used for trillion-parameter MoE
+    deployments), none of (1)/(2)/(3) trigger -- ``preprocess_linear_fusion``
+    is a no-op.  In that case the dummy forward + ``collect_shared_input_modules``
+    walk that drives this function is pure overhead: every shard-aware
+    forward through the unsharded model materialises a full layer's worth
+    of params on each FSDP2 rank.  At Kimi K2.6 scale (1.04T params, ~17B
+    params per layer => ~34 GiB unsharded per rank on top of ~130 GiB
+    resident sharded weights) that pushes a 4xGB200 pod past its 184 GiB
+    HBM budget and OOMs at 181 GiB on a 28 MiB allocation in
+    ``collect_shared_input_modules``.
+
+    The walk is O(n_modules), bounded by ~256k modules even for K2.6 -- a
+    couple of seconds at worst, vs. the full dummy forward + per-layer
+    unshard cycle it elides.
+
+    Dynamic-block subtlety: ``algorithm: max`` calibration unconditionally
+    accumulates a per-tensor ``amax`` during forward, *regardless* of
+    whether the quantizer's ``block_sizes.type`` is static or dynamic.
+    For static-block quant, that scalar amax becomes the per-tensor
+    scale's denominator and is read at inference -- fusion's
+    amax-unification across siblings matters.  For dynamic-block quant
+    (NVFP4 dynamic, MXFP4, MXFP8, etc.), the inference kernel computes
+    scales per-block from the input itself; the scalar amax is dead
+    calibration metadata that the kernel never reads.  Treating those
+    quantizers as fusable is the bug that the K2.6 OOM uncovered: the
+    dummy forward fires to drive a fusion pass whose only effect is to
+    overwrite a value nothing reads, while triggering the per-layer
+    unshard that pushes a 4xGB200 rank past 184 GiB.  Distinguishing
+    them via ``block_sizes.type == "dynamic"`` is sufficient.
+    """
+
+    def _amax_is_inference_used(q) -> bool:
+        """True iff a scalar amax on ``q`` is read at inference time."""
+        if not getattr(q, "is_enabled", False):
+            return False
+        amax = getattr(q, "amax", None)
+        if amax is None or not hasattr(amax, "numel") or amax.numel() != 1:
+            return False
+        block_sizes = getattr(q, "block_sizes", None)
+        # Dynamic-block quantizers compute per-block scales at runtime;
+        # the scalar amax we collected during MAX calibration is unused.
+        if isinstance(block_sizes, dict) and block_sizes.get("type") == "dynamic":
+            return False
+        return True
+
+    for module in model.modules():
+        for quant_attr in ("input_quantizer", "weight_quantizer"):
+            quantizer = getattr(module, quant_attr, None)
+            if quantizer is None:
+                continue
+            # AWQ / SVDQUANT pre_quant_scale -- non-None means this module
+            # contributed a smoothing scale that may need averaging across
+            # siblings.  Cheap attribute check; no tensor materialisation.
+            if getattr(quantizer, "pre_quant_scale", None) is not None:
+                return True
+            # SequentialQuantizer wraps multiple TensorQuantizers (e.g. the
+            # W4A8 INT4-AWQ + FP8 cascade); inspect each leg.
+            if isinstance(quantizer, SequentialQuantizer):
+                for sub_q in quantizer:
+                    if _amax_is_inference_used(sub_q):
+                        return True
+                continue
+            if _amax_is_inference_used(quantizer):
+                return True
+    return False
+
+
 @torch.no_grad()
 def requantize_resmooth_fused_llm_layers(model: torch.nn.Module):
     """Group modules that take the same input and register shared parameters in module.
@@ -325,6 +407,13 @@ def requantize_resmooth_fused_llm_layers(model: torch.nn.Module):
     "Tried to allocate 28.00 MiB" with 181 GiB already in use, all
     activations.  Inference-only autograd is never needed for this
     fusion analysis.
+
+    For recipes whose quantizer state is purely dynamic-block (no
+    pre_quant_scale, no scalar amax) the fusion step itself is a no-op:
+    ``preprocess_linear_fusion`` finds nothing to unify.  In that case
+    the dummy forward through the (FSDP2-resharded) model is pure waste --
+    it triggers a per-layer unshard cycle that *itself* OOMs even before
+    the resmooth/fuse logic gets a chance to short-circuit.  Skip it.
     """
     # TODO: Handle DBRX MoE
     quantization_format = get_quantization_format(model)
@@ -353,6 +442,14 @@ def requantize_resmooth_fused_llm_layers(model: torch.nn.Module):
             for modules in grouped_experts:
                 with fsdp2_aware_weight_update(model, modules):
                     preprocess_linear_fusion(modules, resmooth_only=True)
+
+    # Skip the dummy-forward-driven shared-input fusion when no quantizer
+    # state would actually be unified.  See ``_has_fusable_quant_state``
+    # docstring for the full rationale; the cheap O(n_modules) walk is the
+    # only thing standing between dynamic-block NVFP4 recipes and a
+    # trillion-parameter export OOM.
+    if not _has_fusable_quant_state(model):
+        return
 
     # Define the dummy forward function for LLM
     def llm_dummy_forward():
@@ -678,11 +775,13 @@ def _process_quantized_modules(
                 set_expert_quantizer_amax(
                     modules=sub_module,
                     quantizer_attrs=["gate_up_proj_weight_quantizer", "down_proj_weight_quantizer"],
+                    root_model=model,
                 )
                 # Handle input quantizers amax values using smart fallback logic
                 set_expert_quantizer_amax(
                     modules=sub_module,
                     quantizer_attrs=["gate_up_proj_input_quantizer", "down_proj_input_quantizer"],
+                    root_model=model,
                 )
                 # Export the quantized weights
                 with fsdp2_aware_weight_update(model, sub_module, reshard=False):
@@ -750,6 +849,7 @@ def _export_transformers_checkpoint(
                             set_expert_quantizer_amax(
                                 modules=list(linear_modulelist),
                                 quantizer_attrs=["input_quantizer"],
+                                root_model=model,
                             )
                 elif hasattr(sub_module.experts, "gate_up_proj_weight_quantizers"):
                     # _QuantFusedExperts: amax fallback is handled in _export_fused_experts
@@ -765,6 +865,7 @@ def _export_transformers_checkpoint(
                                 set_expert_quantizer_amax(
                                     modules=[linear_module],
                                     quantizer_attrs=["input_quantizer"],
+                                    root_model=model,
                                 )
                 elif isinstance(sub_module.experts, collections.abc.Iterable):
                     # For other MoE models (like Mixtral) with iterable experts
@@ -772,6 +873,7 @@ def _export_transformers_checkpoint(
                         set_expert_quantizer_amax(
                             modules=[getattr(expert, linear_name) for expert in sub_module.experts],
                             quantizer_attrs=["input_quantizer"],
+                            root_model=model,
                         )
                     except AttributeError as e:
                         # Provide more helpful debugging information
