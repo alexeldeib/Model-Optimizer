@@ -257,6 +257,31 @@ def export_model(
         # Save model
         model.save_pretrained(export_dir, state_dict=post_state_dict, save_modelopt_state=False)
 
+        # transformers' save_pretrained walks the model class's MRO and
+        # copies any ``trust_remote_code``-style source files for ancestor
+        # classes that ``inspect.getfile()`` resolves outside the
+        # transformers package.  For an FSDP2-wrapped model the MRO
+        # includes ``torch.distributed.fsdp._fully_shard.FSDPModule`` and
+        # friends, so the entire ``torch/distributed/fsdp/_fully_shard/``
+        # directory (~150 KiB of PyTorch internals) lands in the export
+        # dir alongside the safetensors.  These aren't part of the
+        # released checkpoint; strip them so a downstream
+        # ``AutoModelForCausalLM.from_pretrained(..., trust_remote_code=True)``
+        # doesn't trip over them.
+        for stray in (
+            "_fsdp_api.py",
+            "_fsdp_collectives.py",
+            "_fsdp_common.py",
+            "_fsdp_init.py",
+            "_fsdp_param.py",
+            "_fsdp_param_group.py",
+            "_fsdp_state.py",
+            "_fully_shard.py",
+        ):
+            stray_path = export_dir / stray
+            if stray_path.exists():
+                stray_path.unlink()
+
         original_config = f"{export_dir}/config.json"
         config_data = {}
 
