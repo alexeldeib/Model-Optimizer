@@ -146,6 +146,7 @@ if [[ "${NODE_RANK}" == "0" && -n "${S3_DEST_PREFIX:-}" && -d "${EXPORT_DIR}" ]]
 import os
 import pathlib
 import boto3
+from botocore.config import Config
 
 src = pathlib.Path("${EXPORT_DIR}")
 dest = "${S3_DEST_PREFIX}".rstrip("/")
@@ -158,7 +159,19 @@ session = boto3.session.Session(
     aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
     region_name=os.environ.get("AWS_REGION", "US-EAST-04"),
 )
-s3 = session.client("s3", endpoint_url=os.environ["AWS_ENDPOINT_URL"])
+# CW's S3-compatible endpoint (cwlota.com / cwobject.com) requires
+# virtual-hosted-style addressing -- "bucket.endpoint/key" -- and rejects
+# the path-style "endpoint/bucket/key" form with PathStyleRequestNotAllowed.
+# boto3's default for non-AWS endpoints is path-style, so override here.
+# Without this we hit:
+#   boto3.exceptions.S3UploadFailedError: ... PathStyleRequestNotAllowed:
+#   The path style requests are not allowed for this method, please switch
+#   to hostname-based requests.
+s3 = session.client(
+    "s3",
+    endpoint_url=os.environ["AWS_ENDPOINT_URL"],
+    config=Config(s3={"addressing_style": "virtual"}),
+)
 
 uploaded = 0
 total_bytes = 0
