@@ -1649,21 +1649,29 @@ def layerwise_calibrate(
 
             def _layer_forward_loop(m, _inputs=layer_inputs):
                 for args, kwargs_input in _inputs:
-                    # Reset past_key_values to prevent the KV cache from
-                    # accumulating across multiple forward replays (e.g.
-                    # max_calibrate then Hessian collection in GPTQ).
-                    # The layer doesn't need stale KV data — each replay
-                    # should start with a fresh cache.
-                    if (
-                        "past_key_values" in kwargs_input
-                        and kwargs_input["past_key_values"] is not None
+                    # Reset every captured cache-like kwarg so the KV
+                    # cache cannot accumulate across replays.  Both
+                    # transformers (``past_key_values``) and several
+                    # custom modeling files in the wild (``past_key
+                    # _value`` -- e.g. K2.6's modeling_deepseek.py,
+                    # which appends k/v in attention via past_key
+                    # _value.update()) need to be covered.  Iterating
+                    # known names is safer than guessing by attribute,
+                    # since some callers stuff non-cache objects under
+                    # similarly-named keys.
+                    cache_keys = ("past_key_values", "past_key_value")
+                    if any(
+                        kwargs_input.get(k) is not None for k in cache_keys
                     ):
                         kwargs_input = dict(kwargs_input)
-                        cache = kwargs_input["past_key_values"]
-                        if hasattr(cache, "reset"):
-                            cache.reset()
-                        else:
-                            kwargs_input["past_key_values"] = None
+                        for k in cache_keys:
+                            cache = kwargs_input.get(k)
+                            if cache is None:
+                                continue
+                            if hasattr(cache, "reset"):
+                                cache.reset()
+                            else:
+                                kwargs_input[k] = None
                     m(*args, **kwargs_input)
 
             with persistent_materialization(layer):

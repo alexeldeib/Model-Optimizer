@@ -227,11 +227,40 @@ class LayerActivationCollector:
                     f"Layer {info.name} is in 'run' mode but has no cached inputs to replay."
                 )
                 real_args, real_kwargs = info.cached_inputs.popleft()
+                # ``real_kwargs`` was captured from a prior forward pass.
+                # Some custom modeling files (e.g. K2.6's
+                # modeling_deepseek.py) accept a ``past_key_value``
+                # argument and call ``past_key_value.update(...)`` to
+                # append k/v in attention -- so a captured cache object
+                # gets mutated on every replay, doubling kv_seq_len and
+                # raising "Attention mask should be of size (B,1,Q,2K),
+                # but is (B,1,Q,K)" on the second pass.  Drop any
+                # cache-shaped kwarg before replaying; the layer's own
+                # forward path will rebuild a fresh cache (or skip cache
+                # logic) when it sees None.  Both transformers
+                # (``past_key_values`` plural) and custom modeling
+                # (``past_key_value`` singular) naming are covered.
+                cache_keys = ("past_key_values", "past_key_value")
+                if any(k in real_kwargs for k in cache_keys):
+                    real_kwargs = dict(real_kwargs)
+                    for k in cache_keys:
+                        if k in real_kwargs:
+                            real_kwargs[k] = None
                 output = self._original_forward(*real_args, **real_kwargs)
                 info.output_meta = LayerActivationCollector._extract_output_meta(output)
                 return output
 
             if info.mode == "capture":
+                # Strip cache-shaped kwargs at capture time as well so
+                # downstream replays can never see a stale (mutated)
+                # cache reference -- defence in depth versus the run-
+                # mode reset above.
+                cache_keys = ("past_key_values", "past_key_value")
+                if any(k in kwargs for k in cache_keys):
+                    kwargs = dict(kwargs)
+                    for k in cache_keys:
+                        if k in kwargs:
+                            kwargs[k] = None
                 info.collected_inputs.append((args, kwargs))
                 raise _EarlyStopForwardError()
 
