@@ -326,22 +326,20 @@ def load_and_prepare_model(
         model_dtype = getattr(torch, model_dtype, torch.bfloat16)
     with init_empty_weights():
         with patch_compressed_linear_loading():
-            # ``attn_implementation="eager"`` avoids FlashAttention-2's
-            # KV-cache mutation across forwards, which breaks modelopt's
-            # layerwise_calibrate replay path on transformers 5.x for
-            # custom attention modules.  K2.6's MLA expansion grows
-            # k_len from 512 -> 1024 between captures, raising
-            # "Attention mask should be of size (B,1,Q,2*K)..." despite
-            # ``model.config.use_cache = False``.  Eager attention is
-            # slower but doesn't carry KV state in a way the captured-
-            # then-replayed kwargs can't reset.  Calibration overhead
-            # is negligible vs. K2.6's compute footprint; serving still
-            # uses FA2 (the recipe doesn't quantize attention).
+            # No explicit attn_implementation: let from_config pick the
+            # default (FlashAttention-2 if available).  The cache-strip
+            # fix in modelopt/torch/quantization/utils/layerwise_calib.py
+            # neutralises FA2's KV mutation by stripping past_key_value
+            # references from captured kwargs, so we don't need eager.
+            # Eager attention was tried and exposed a separate FSDP2
+            # _lazy_init issue on K2.6 (reset_sharded_param accessing
+            # _local_tensor on a non-DTensor param), suggesting the
+            # eager path produces module structure FSDP2's lazy_init
+            # doesn't expect for custom DeepseekV3 modeling.
             model = AutoModelForCausalLM.from_config(
                 config,
                 trust_remote_code=trust_remote_code,
                 dtype=model_dtype,
-                attn_implementation="eager",
             )
 
     model.eval()
