@@ -695,15 +695,27 @@ def main(args):
             tokenizer.padding_side = default_padding_side
             tokenizer.save_pretrained(args.export_path)
         # Multimodal models (KimiK25ForConditionalGeneration, Llava,
-        # Llama-4-VL, ...) ship a separate AutoProcessor with image/audio
-        # preprocessor configs; ``model.save_pretrained`` only saves the
-        # core model + ``hf_quant_config.json`` and does NOT propagate
-        # those.  Without ``preprocessor_config.json`` in the export dir
-        # vLLM's renderer fails at load time with:
-        #   OSError: Can't load image processor for '<export_dir>'
-        #   ... make sure '<export_dir>' is the correct path to a
-        #   directory containing a preprocessor_config.json file
-        # Save the processor explicitly when the source model has one.
+        # Llama-4-VL, ...) ship a separate AutoProcessor *plus* a chain
+        # of trust_remote_code source files (image_processing_*.py,
+        # processor_*.py, media_utils.py, ...) that ``model.save_pretrained``
+        # does not propagate to the export dir even with ``auto_map``
+        # in config.json.  Saving the processor catches the
+        # ``preprocessor_config.json`` and any first-level dependent
+        # source the AutoProcessor instance pulls in via
+        # ``inspect.getfile()``, but transformers does not transitively
+        # follow ``import`` statements -- so a custom processor that
+        # imports ``media_utils`` will write ``processor_config.json``
+        # but miss ``media_utils.py`` entirely.  Result: vLLM load fails
+        # later with:
+        #   OSError: <export_dir> does not appear to have a file named
+        #     <kimi_k25_vision_processing.py> ...
+        #
+        # Fix: belt-and-suspenders.  First save the processor (gets the
+        # standard config files); then sync every non-weight auxiliary
+        # file from source -> export.  Safetensors and safetensors-index
+        # files are excluded because the export dir has its own quantized
+        # versions; everything else (.py, .json, .jinja, .model,
+        # .tiktoken) is copy-on-missing.
         try:
             from transformers import AutoProcessor
 
@@ -716,6 +728,34 @@ def main(args):
             # Text-only models don't have an AutoProcessor entry;
             # this is benign in that case.
             print(f"No AutoProcessor for {args.pyt_ckpt_path} (text-only?): {e}")
+
+        import shutil
+        from pathlib import Path
+
+        src_root = Path(args.pyt_ckpt_path)
+        if src_root.is_dir():
+            dst_root = Path(args.export_path)
+            _weight_suffixes = {".safetensors", ".bin", ".pt", ".pth"}
+            copied = []
+            for src in src_root.iterdir():
+                if not src.is_file():
+                    continue
+                # Skip the BF16 weights and their index -- the export
+                # has its own NVFP4 packed equivalents.
+                if src.suffix in _weight_suffixes:
+                    continue
+                if src.name.endswith(".safetensors.index.json"):
+                    continue
+                dst = dst_root / src.name
+                if dst.exists():
+                    continue
+                shutil.copy2(src, dst)
+                copied.append(src.name)
+            if copied:
+                print(
+                    f"Copied {len(copied)} auxiliary file(s) from source: "
+                    + ", ".join(sorted(copied))
+                )
         # Export the model
         print(f"Export completed in {elapsed:.2f}s")
         print(f"Model exported to {args.export_path}")
