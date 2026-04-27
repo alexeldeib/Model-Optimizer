@@ -47,6 +47,41 @@ quantize:
     # and only keeps the per-layer quantizer state.
     method: max
     layerwise: true
+    # Force calibration to route every token to ALL 384 experts (top_k =
+    # num_experts) so each expert sees a representative subset, then keep
+    # per-expert calibration statistics.  CRITICAL for K2.6 quality.
+    #
+    # Without this knob, modelopt's HF MoE plugin runs
+    # ``layer_sync_moe_local_experts_amax`` after calibration which calls
+    # ``sync_moe_expert_amax(self.experts)`` -- "Takes the element-wise
+    # max of each input_quantizer amax across all experts and writes it
+    # back, so every expert shares the same input amax."  At trillion-
+    # parameter MoE scale (K2.6 = 1.04T params, 384 routed experts,
+    # top_k=8) this broadcast destroys per-expert specialization: every
+    # expert in a layer gets the same input_scale (e.g. layer 30 gate/up
+    # = 1.002720e-04 across experts.{0..383}), the FP4 input quantization
+    # uses one shared scale for activations that are routed-by-expert,
+    # and vLLM's NVFP4 MoE kernel produces literal repetitive garbage
+    # ("foss foss foss...") at inference -- gsm8k=0%, mmlu=27%, all
+    # tasks at random chance regardless of recipe coverage.
+    #
+    # Setting this to 1.0 makes ``layer_sync_moe_local_experts_amax``
+    # short-circuit (see ``_QuantSparseSequentialMoe.layer_sync_moe_local_experts_amax``
+    # in modelopt/torch/quantization/plugins/huggingface.py:599 -- "if
+    # self._moe_calib_experts_ratio is not None: return"), so each
+    # expert's input_quantizer keeps the amax it computed from its own
+    # routed token subset.  Compare nvidia/Kimi-K2.5-NVFP4 which has
+    # per-expert input_scale variation 4.77e-4 / 5.00e-4 / 5.06e-4 for
+    # experts 0/1/10 -- exactly this shape.
+    #
+    # Cost: calibration forward becomes top_k=384 (vs deployment's
+    # top_k=8), so each expert sees 48× more tokens during the cal pass.
+    # Wall-clock ~50% slower than the broken-broadcast path; quality
+    # recovery is the entire point of this run.  ``1.0`` (full coverage)
+    # rather than e.g. ``0.5`` because we want EVERY expert calibrated
+    # for K2.6, not just the most-routed ones; trillion-parameter MoE
+    # has long-tail experts that matter.
+    moe_calib_experts_ratio: 1.0
   quant_cfg:
     # 1) Disable everything by default.  Selectors below opt-in.
     - quantizer_name: '*'
