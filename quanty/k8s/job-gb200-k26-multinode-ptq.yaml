@@ -1,7 +1,7 @@
 ---
-# K2.6 NVFP4 multinode PTQ on 8x GB200 nodes (32 GPUs, ~6 TB HBM total).
+# K2.6 NVFP4 multinode PTQ on 7x GB200 nodes (28 GPUs, ~5.2 TB HBM total).
 #
-# Scaled from 4 nodes to 8 to put headroom under the export step.
+# Scaled from 4 nodes to 7 to put headroom under the export step.
 # At 4 nodes, per-rank shard = 1.04T / 16 ranks = 130 GiB resident
 # weights; the export's per-decoder-layer unshard adds ~17B params
 # x 2 bytes = ~34 GiB on top, plus calibration buffers + the
@@ -9,14 +9,17 @@
 # pushing peak to 181 GiB on a 184 GiB GB200.  The dummy_forward
 # OOM in requantize_resmooth_fused_llm_layers is gone (commits
 # d8b415ae2 + 227302817), but the per-module unshard loop in
-# _process_quantized_modules then hits the same wall.  Doubling
-# world_size halves the resident shard (130 -> 65 GiB) and leaves
-# ~85 GiB peak vs. 184 GiB available -- comfortable margin for the
-# weight conversion + state_dict gather steps.
+# _process_quantized_modules then hits the same wall.  Bumping
+# world_size to 28 cuts the resident shard to 1.04T / 28 = ~74 GiB,
+# leaves ~17 GiB unshard delta per layer, and ~17 GiB buffers ->
+# peak ~108 GiB vs. 184 GiB ceiling.  Cluster has 7 unbooked GB200
+# nodes (the other 9 are running k26-int4 / c2-k25-bench /
+# kimi-k25 serving / deepseek-v4-pro / etc.); 8 nodes won't
+# schedule, 7 fits exactly.  ~76 GiB margin per rank.
 #
 # Topology:
-#   * Indexed Job, parallelism=completions=8 -> pods 0..7
-#   * Each pod gets 4x GB200 GPUs (32 GPUs total)
+#   * Indexed Job, parallelism=completions=7 -> pods 0..6
+#   * Each pod gets 4x GB200 GPUs (28 GPUs total)
 #   * Pod-0 is torchrun rendezvous master, reachable via the headless
 #     service DNS as quanty-gb200-k26-mn-ptq-0.<svc>:29500
 #   * Layerwise checkpoint dir on shared PVC means a preempted pod
@@ -59,8 +62,8 @@ spec:
   # (0..parallelism-1).  k8s 1.27+ also auto-sets hostname to
   # <job-name>-<index>, so workers reach pod-0 via DNS without an
   # init-container peek.
-  parallelism: 8
-  completions: 8
+  parallelism: 7
+  completions: 7
   completionMode: Indexed
   # 8 = ~2 retries per pod.  The layerwise checkpoint resume picks up
   # from the last fully-written layer so a single-node failure costs
@@ -153,7 +156,7 @@ spec:
             - name: NUM_GPUS
               value: "4"
             - name: NNODES
-              value: "8"
+              value: "7"
             - name: MASTER_ADDR
               value: "quanty-gb200-k26-mn-ptq-0.quanty-gb200-k26-mn-rdzv.ace-inference.svc.cluster.local"
             - name: MASTER_PORT
