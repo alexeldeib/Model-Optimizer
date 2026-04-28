@@ -47,41 +47,42 @@ quantize:
     # and only keeps the per-layer quantizer state.
     method: max
     layerwise: true
-    # Force calibration to route every token to ALL 384 experts (top_k =
-    # num_experts) so each expert sees a representative subset, then keep
-    # per-expert calibration statistics.  CRITICAL for K2.6 quality.
+    # Skip ``sync_moe_expert_amax`` (the post-calibration broadcast that
+    # element-wise-maxes every expert's input_quantizer.amax across all
+    # experts in a layer, destroying per-expert specialization).  Setting
+    # this knob to ANY non-None value makes
+    # ``_QuantSparseSequentialMoe.layer_sync_moe_local_experts_amax``
+    # early-return -- see
+    # modelopt/torch/quantization/plugins/huggingface.py:599
+    # ("if self._moe_calib_experts_ratio is not None: return").
     #
-    # Without this knob, modelopt's HF MoE plugin runs
-    # ``layer_sync_moe_local_experts_amax`` after calibration which calls
-    # ``sync_moe_expert_amax(self.experts)`` -- "Takes the element-wise
-    # max of each input_quantizer amax across all experts and writes it
-    # back, so every expert shares the same input amax."  At trillion-
-    # parameter MoE scale (K2.6 = 1.04T params, 384 routed experts,
-    # top_k=8) this broadcast destroys per-expert specialization: every
-    # expert in a layer gets the same input_scale (e.g. layer 30 gate/up
-    # = 1.002720e-04 across experts.{0..383}), the FP4 input quantization
-    # uses one shared scale for activations that are routed-by-expert,
-    # and vLLM's NVFP4 MoE kernel produces literal repetitive garbage
-    # ("foss foss foss...") at inference -- gsm8k=0%, mmlu=27%, all
-    # tasks at random chance regardless of recipe coverage.
+    # The previous attempt set this to ``1.0`` (full coverage), which
+    # forces ``top_k = num_experts = 384`` during the calibration forward.
+    # That route every token through every expert -- so every expert
+    # sees the SAME hidden_state at gate_proj input (the routing weight
+    # is applied to expert OUTPUT, not input), and MAX calibration gives
+    # IDENTICAL amax across all experts.  Verified empirically
+    # 2026-04-27 22:00Z: with ratio=1.0, layer 30 gate/up_proj.input_scale
+    # = 9.954543e-05 across experts.{0..383} (n=384 unique=1 std=0).
+    # That produces a checkpoint that loads cleanly under FLASHINFER_CUTLASS
+    # NVFP4 MoE but lm-eval scores at random chance because the
+    # absolute magnitude is 5x smaller than NVIDIA's reference
+    # (input_scale = amax / (6*448) export formula -> our amax ~0.27
+    # vs nvidia/Kimi-K2.5-NVFP4 amax ~1.34).
     #
-    # Setting this to 1.0 makes ``layer_sync_moe_local_experts_amax``
-    # short-circuit (see ``_QuantSparseSequentialMoe.layer_sync_moe_local_experts_amax``
-    # in modelopt/torch/quantization/plugins/huggingface.py:599 -- "if
-    # self._moe_calib_experts_ratio is not None: return"), so each
-    # expert's input_quantizer keeps the amax it computed from its own
-    # routed token subset.  Compare nvidia/Kimi-K2.5-NVFP4 which has
-    # per-expert input_scale variation 4.77e-4 / 5.00e-4 / 5.06e-4 for
-    # experts 0/1/10 -- exactly this shape.
+    # Setting this to ``0.001`` keeps natural top_k=8 routing during
+    # calibration (``max(original_top_k=8, round(num_experts*0.001)=0)
+    # = 8``) so each expert sees ONLY the tokens routed to it -- giving
+    # per-expert amax variation that matches nvidia/Kimi-K2.5-NVFP4's
+    # published 4.77e-4 / 5.00e-4 / 5.06e-4 pattern for experts 0/1/10.
     #
-    # Cost: calibration forward becomes top_k=384 (vs deployment's
-    # top_k=8), so each expert sees 48× more tokens during the cal pass.
-    # Wall-clock ~50% slower than the broken-broadcast path; quality
-    # recovery is the entire point of this run.  ``1.0`` (full coverage)
-    # rather than e.g. ``0.5`` because we want EVERY expert calibrated
-    # for K2.6, not just the most-routed ones; trillion-parameter MoE
-    # has long-tail experts that matter.
-    moe_calib_experts_ratio: 1.0
+    # Cost: dual calibration forwards (the "calib" and "actual" forward
+    # in plugins/huggingface.py:537-587) but both now at top_k=8, so
+    # roughly 2x the compute of a single top_k=8 calibration.  Statistical
+    # power: with CALIB_SAMPLES=512 and top_k=8 routing across 384
+    # experts, each expert sees ~512*2048*8/384 = 21k tokens on
+    # average (assuming balanced routing) -- enough for a stable amax.
+    moe_calib_experts_ratio: 0.001
   quant_cfg:
     # 1) Disable everything by default.  Selectors below opt-in.
     - quantizer_name: '*'

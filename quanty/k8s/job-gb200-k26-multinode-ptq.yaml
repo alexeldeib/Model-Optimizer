@@ -176,23 +176,34 @@ spec:
             - name: EXPORT_DIR
               value: /work/quanty/exports/k26-nvfp4-mn
             - name: CALIB_DATASET
-              value: nemotron-post-training-dataset-v2
-            # With moe_calib_experts_ratio=1.0 enabled in the recipe,
-            # calibration forwards every token through ALL 384 experts
-            # (top_k=384 instead of deployment's top_k=8).  The output
-            # concatenation in DeepseekV3MoE.moe_infer scales linearly with
-            # top_k, so cat(outputs, ...) at BATCH=8 SEQ_LEN=2048 needs
-            # 8 * 2048 * 384 * 7168 * 2 bytes = 88 GiB on top of the
-            # 168 GiB resident model state -- OOMs at 21 GiB allocation
-            # request.
-            #
-            # Cut BATCH to 1 to bring the cat tensor down to ~11 GiB
-            # (8x reduction from BATCH=8); SAMPLES from 2048 to 512
-            # because every-token-to-every-expert calibration already
-            # gives 4x more per-expert coverage than top_k=8 SAMPLES=2048
-            # (each expert sees 512 * 2048 = 1M tokens instead of
-            # 2048 * 2048 * 8 / 384 = 87k tokens), so reducing samples
-            # doesn't lose statistical power.
+              # Match NVIDIA's published nvidia/Kimi-K2.5-NVFP4 recipe
+              # which used cnn_dailymail.  The K2.6 NVFP4 quality
+              # regression observed 2026-04-27 (gsm8k=0%, mmlu=27%
+              # despite recipe-level moe_calib_experts_ratio=1.0 fix)
+              # was traced to amax magnitudes ~5x smaller than NVIDIA's
+              # reference (our amax ~0.27 vs theirs ~1.34, derived from
+              # input_scale = amax / (6 * 448) export formula).  Switching
+              # the calibration dataset from nemotron-post-training-dataset-v2
+              # (chat-templated post-training mix) to cnn_dailymail
+              # (raw English news, what NVIDIA used) brings the calibrated
+              # activation distribution into the regime that produces
+              # working FP4 dynamic-block scales without saturating the
+              # FP8 e4m3 anchor.
+              value: cnn_dailymail
+            # With moe_calib_experts_ratio dialed down to 0.001 (the
+            # documented escape hatch for skipping the broadcast sync,
+            # see recipe docs), calibration uses natural top_k=8 routing,
+            # not the previous top_k=384 forced expansion.  That means:
+            #   * The cat(outputs, ...) tensor in DeepseekV3MoE.moe_infer
+            #     is back to its top_k=8 footprint (~11 GiB at BATCH=1
+            #     SEQ_LEN=2048), so we have headroom for BATCH > 1.
+            #   * Each expert now sees ONLY tokens routed to it during
+            #     calibration -- ~21k tokens/expert at SAMPLES=512
+            #     (vs the prior 1M/expert under top_k=384), but with
+            #     genuinely per-expert calibration statistics.
+            # Keeping BATCH=1 / SAMPLES=512 conservatively for now;
+            # increasing BATCH may speed iteration once we confirm
+            # the cnn_dailymail + ratio=0.001 combo recovers quality.
             - name: CALIB_SAMPLES
               value: "512"
             - name: CALIB_BATCH
