@@ -16,6 +16,7 @@
 """Multi-node PTQ (Post-Training Quantization) with FSDP2 support."""
 
 import argparse
+import copy
 import json
 import os
 import random
@@ -120,6 +121,12 @@ def parse_args():
         help="Comma-separated list of calibration sizes per dataset",
     )
     parser.add_argument(
+        "--calib_seq",
+        type=int,
+        default=512,
+        help="Maximum tokenized sequence length for calibration samples",
+    )
+    parser.add_argument(
         "--dataset",
         help=(
             f"name of a dataset, or a comma separated list of datasets. "
@@ -137,6 +144,14 @@ def parse_args():
         "--trust_remote_code",
         action="store_true",
         help="Trust remote code for HuggingFace models",
+    )
+    parser.add_argument(
+        "--require_moe_coverage",
+        action="store_true",
+        help=(
+            "Fail before export if MoE token-count diagnostics show any routed expert "
+            "received zero forced-calibration tokens."
+        ),
     )
     parser.add_argument("--awq_block_size", default=0, type=int)
 
@@ -264,7 +279,7 @@ def _load_sharded_weights_from_safetensors(
                 state_dict[key] = fh.get_tensor(key)
         set_model_state_dict(model, state_dict, options=options)
         del state_dict
-        if accelerator.is_main_process and ((i + 1) % 8 == 0 or (i + 1) == n_shards):
+        if accelerator.is_main_process:
             print(f"  shard {i + 1}/{n_shards}: {shard_file}")
 
     accelerator.wait_for_everyone()
@@ -313,6 +328,7 @@ def load_and_prepare_model(
         print(f"Meta-initializing model from {model_path}...")
 
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
+    original_auto_map = copy.deepcopy(getattr(config, "auto_map", None))
     # Resolve dtype explicitly: ``from_pretrained`` special-cases the
     # string ``"auto"`` to mean "use the config's dtype", but
     # ``from_config`` calls ``getattr(torch, dtype)`` directly and
@@ -341,6 +357,7 @@ def load_and_prepare_model(
                 trust_remote_code=trust_remote_code,
                 dtype=model_dtype,
             )
+    model._modelopt_original_auto_map = original_auto_map
 
     model.eval()
     model.requires_grad_(False)
@@ -356,6 +373,7 @@ def load_and_prepare_model(
     # needs the cache, so disabling it at the config level is the
     # conservative correct fix.
     if hasattr(model, "config") and hasattr(model.config, "use_cache"):
+        model._modelopt_original_use_cache = model.config.use_cache
         model.config.use_cache = False
 
     model_type = get_model_type(model)
@@ -430,6 +448,7 @@ def create_calibration_dataloader(
     dataset_names: list[str],
     calib_sizes: list[int],
     batch_size: int,
+    max_sample_length: int,
 ) -> torch.utils.data.DataLoader:
     """Create calibration dataloader from dataset.
 
@@ -438,6 +457,7 @@ def create_calibration_dataloader(
         dataset_names: List of dataset names (defaults to cnn_dailymail)
         calib_sizes: Number of samples for each dataset
         batch_size: Batch size for calibration
+        max_sample_length: Maximum tokenized sequence length per calibration sample
 
     Returns:
         DataLoader for calibration
@@ -448,9 +468,85 @@ def create_calibration_dataloader(
         tokenizer=tokenizer,
         batch_size=batch_size,
         num_samples=calib_sizes,
+        max_sample_length=max_sample_length,
         device=None,  # Keep data on CPU, calibration loop handles device transfer
         include_labels=False,
     )
+
+
+def summarize_moe_token_coverage(
+    model: nn.Module,
+    output_dir: str | Path,
+    accelerator: Accelerator,
+    require_full_coverage: bool = False,
+) -> None:
+    """Write MoE calibration token coverage and optionally fail on gaps."""
+
+    rows = []
+    total_missing = 0
+    total_experts = 0
+
+    for name, module in model.named_modules():
+        counts = getattr(module, "expert_token_count", None)
+        if not isinstance(counts, torch.Tensor) or counts.numel() == 0:
+            continue
+
+        synced_counts = counts.detach().clone()
+        if torch.distributed.is_initialized():
+            if synced_counts.device.type == "cpu" and torch.cuda.is_available():
+                synced_counts = synced_counts.to(torch.cuda.current_device())
+            torch.distributed.all_reduce(synced_counts, op=torch.distributed.ReduceOp.SUM)
+
+        counts_cpu = synced_counts.cpu()
+        missing = torch.nonzero(counts_cpu == 0, as_tuple=False).flatten().tolist()
+        total_missing += len(missing)
+        total_experts += counts_cpu.numel()
+        rows.append(
+            {
+                "name": name,
+                "count_source": getattr(module, "_expert_token_count_source", "gate_hook"),
+                "num_experts": counts_cpu.numel(),
+                "covered_experts": int((counts_cpu > 0).sum().item()),
+                "missing_experts": missing,
+                "min_tokens": int(counts_cpu.min().item()),
+                "p50_tokens": int(torch.quantile(counts_cpu.float(), 0.50).item()),
+                "p99_tokens": int(torch.quantile(counts_cpu.float(), 0.99).item()),
+                "max_tokens": int(counts_cpu.max().item()),
+                "total_tokens": int(counts_cpu.sum().item()),
+            }
+        )
+
+    summary = {
+        "moe_layers_with_counts": len(rows),
+        "total_experts": total_experts,
+        "total_missing_experts": total_missing,
+        "layers": rows,
+    }
+
+    if accelerator.is_main_process:
+        diagnostics_dir = Path(output_dir) / "diagnostics"
+        diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        summary_path = diagnostics_dir / "moe-token-coverage.json"
+        with summary_path.open("w") as f:
+            json.dump(summary, f, indent=2)
+        print(
+            "MoE calibration coverage: "
+            f"{total_experts - total_missing}/{total_experts} experts covered "
+            f"across {len(rows)} layer(s); report={summary_path}"
+        )
+
+    if require_full_coverage:
+        if not rows:
+            raise RuntimeError(
+                "MoE coverage was required, but no expert_token_count buffers were found. "
+                "Check that the recipe sets quantize.algorithm.moe_calib_experts_ratio."
+            )
+        if total_missing:
+            raise RuntimeError(
+                f"MoE coverage was required, but {total_missing}/{total_experts} "
+                "expert slots received zero forced-calibration tokens. "
+                f"See {Path(output_dir) / 'diagnostics' / 'moe-token-coverage.json'}."
+            )
 
 
 def create_fsdp2_calibration_loop(
@@ -503,6 +599,11 @@ def export_model(
     """
     export_dir = Path(export_path)
     export_dir.mkdir(parents=True, exist_ok=True)
+
+    if hasattr(model, "config") and hasattr(model.config, "use_cache"):
+        original_use_cache = getattr(model, "_modelopt_original_use_cache", None)
+        if original_use_cache is not None:
+            model.config.use_cache = original_use_cache
 
     # The upstream fix in modelopt/torch/quantization/utils/core_utils.py
     # makes ``fsdp2_aware_weight_update`` build the module-name index
@@ -557,6 +658,12 @@ def export_model(
         config_data["quantization_config"] = hf_quant_config
         # Update config architectures to use original architectures that does not have FSDP prefix
         config_data["architectures"] = architectures
+        original_auto_map = getattr(model, "_modelopt_original_auto_map", None)
+        if original_auto_map:
+            config_data["auto_map"] = original_auto_map
+        original_use_cache = getattr(model, "_modelopt_original_use_cache", None)
+        if original_use_cache is not None:
+            config_data["use_cache"] = original_use_cache
 
         with open(original_config, "w") as file:
             json.dump(config_data, file, indent=4)
@@ -625,6 +732,7 @@ def main(args):
         dataset_names=args.dataset,
         calib_sizes=args.calib_size,
         batch_size=args.batch_size,
+        max_sample_length=args.calib_seq,
     )
 
     # Load and prepare model
@@ -655,7 +763,7 @@ def main(args):
         )
         enable_quant_kv_cache = args.kv_cache_qformat != "none"
 
-    print(f"{'Enable' if enable_quant_kv_cache else 'Disable'} KV cache quantization")
+    print(f"{'Enable' if enable_quant_kv_cache else 'Recipe-owned/disabled'} KV cache quantization")
 
     # Check if any bmm_quantizer is in the quant_cfg. If so, we need to enable the bmm_quantizer.
     if enable_quant_kv_cache:
@@ -684,6 +792,13 @@ def main(args):
     if accelerator.is_main_process:
         print(f"Quantization completed in {elapsed:.2f}s")
         mtq.print_quant_summary(model)
+
+    summarize_moe_token_coverage(
+        model,
+        args.export_path,
+        accelerator,
+        require_full_coverage=args.require_moe_coverage,
+    )
 
     start_time = time.time()
     export_model(model, accelerator, args.export_path, original_architectures)
@@ -732,13 +847,15 @@ def main(args):
         import shutil
         from pathlib import Path
 
+        dst_root = Path(args.export_path)
         src_root = Path(args.pyt_ckpt_path)
         if src_root.is_dir():
-            dst_root = Path(args.export_path)
             _weight_suffixes = {".safetensors", ".bin", ".pt", ".pth"}
             copied = []
             for src in src_root.iterdir():
                 if not src.is_file():
+                    continue
+                if src.name.startswith("."):
                     continue
                 # Skip the BF16 weights and their index -- the export
                 # has its own NVFP4 packed equivalents.
@@ -820,6 +937,17 @@ def main(args):
                     f"Stripped FSDP-wrapper auto_map from config.json: "
                     f"AutoModelForCausalLM={stray!r}"
                 )
+        removed_fsdp_sources = []
+        for pattern in ("_fsdp*.py", "_fully_shard.py"):
+            for path in dst_root.glob(pattern):
+                if path.is_file():
+                    path.unlink()
+                    removed_fsdp_sources.append(path.name)
+        if removed_fsdp_sources:
+            print(
+                "Removed FSDP wrapper source file(s) from export: "
+                + ", ".join(sorted(removed_fsdp_sources))
+            )
         # Export the model
         print(f"Export completed in {elapsed:.2f}s")
         print(f"Model exported to {args.export_path}")

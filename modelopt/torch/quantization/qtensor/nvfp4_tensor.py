@@ -115,7 +115,11 @@ class NVFP4QTensor(BaseQuantizedTensor):
             # Compute scales in float
             per_block_scale_max = global_amax / 6.0
             per_block_scale = per_block_amax / 6.0
-            per_block_scale[per_block_scale == 0] = 1.0
+            per_block_scale = torch.where(
+                per_block_scale == 0,
+                torch.ones_like(per_block_scale),
+                per_block_scale,
+            )
 
             # Reshape per_block_scale to match weight's block structure
             num_blocks_per_row = weight.shape[-1] // block_size
@@ -163,8 +167,12 @@ class NVFP4QTensor(BaseQuantizedTensor):
         per_block_scale = per_block_amax / (
             6.0 * weights_scaling_factor_2.to(per_block_amax.device)
         )
-        # Set all zero values in scale to 1.0
-        per_block_scale[per_block_scale == 0] = 1.0
+        # Set all zero values in scale to 1.0 while preserving DTensor placement.
+        per_block_scale = torch.where(
+            per_block_scale == 0,
+            torch.ones_like(per_block_scale),
+            per_block_scale,
+        )
         # Convert to torch.float8_e4m3fn
         if not keep_high_precision:
             per_block_scale = per_block_scale.to(torch.float8_e4m3fn)
@@ -204,19 +212,25 @@ class NVFP4QTensor(BaseQuantizedTensor):
         sign_bit = (weight < 0).to(torch.uint8)
         weight_abs = weight.abs_()
 
-        # Get bounds and compute ordinal values
-        e2m1_bounds = cls.get_e2m1_bounds(device)
-        ord = torch.searchsorted(e2m1_bounds, weight_abs, out_int32=True).to(torch.uint8)
-
-        # Efficiently check for rounding at odd-indexed bounds [0.75, 1.75, 2.5]
-        # Only need to check bounds at indices 1, 3, 5
-        odd_bounds = e2m1_bounds[[1, 3, 5]]  # [0.75, 1.75, 2.5]
-        equals_odd_bounds = torch.any(weight_abs.unsqueeze(-1) == odd_bounds, dim=-1).to(
-            torch.uint8
+        # Compute the same lower-bound ordinal as searchsorted(e2m1_bounds, weight_abs)
+        # without mixing the sharded DTensor weight with a regular lookup tensor.
+        ord = (
+            (weight_abs > 0.25).to(torch.uint8)
+            + (weight_abs > 0.75).to(torch.uint8)
+            + (weight_abs > 1.25).to(torch.uint8)
+            + (weight_abs > 1.75).to(torch.uint8)
+            + (weight_abs > 2.5).to(torch.uint8)
+            + (weight_abs > 3.5).to(torch.uint8)
+            + (weight_abs > 5.0).to(torch.uint8)
         )
 
+        # Preserve the existing round-to-even adjustment at bounds indices 1, 3, and 5.
+        equals_odd_bounds = (
+            (weight_abs == 0.75) | (weight_abs == 1.75) | (weight_abs == 3.5)
+        ).to(torch.uint8)
+
         # Combine sign, ordinal, and rounding adjustment
-        return (sign_bit << 3) + ord + equals_odd_bounds
+        return (sign_bit * 8) + ord + equals_odd_bounds
 
     @classmethod
     def quantize(

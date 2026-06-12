@@ -1,0 +1,171 @@
+---
+# Single-node Kimi-K2.6 NVFP4 PTQ verifier for the dequant/hf_ptq.py path.
+#
+# This is intentionally separate from the multinode FSDP2 PTQ job. It follows
+# the colleague-provided recipe:
+#   * NGC PyTorch 25.11
+#   * pip nvidia-modelopt[hf]==0.43.0 + transformers==4.57.1
+#   * Model-Optimizer repo tag 0.43.0 plus the mixed packed/plain loader fix
+#     and a narrow Kimi MoE calibration shim
+#   * INT4 source staged into a writable local model dir
+#   * NVIDIA Kimi-K2.5 NVFP4 modeling_kimi_k25.py overlay
+#   * hf_ptq.py --qformat nvfp4_mlp_only --kv_cache_qformat fp8
+#   * structural export inspection before PVC sync/S3 upload
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: quanty-gb200-k26-dequant-ptq
+  namespace: ace-inference
+  labels:
+    app: quanty-gb200-k26-dequant-ptq
+    workstream: k26-nvfp4-dequant-verify
+    owner: aeldeib
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels:
+        app: quanty-gb200-k26-dequant-ptq
+        owner: aeldeib
+    spec:
+      restartPolicy: Never
+      schedulerName: binpack-scheduler
+      priorityClassName: inference-partial-node
+      nodeSelector:
+        node.coreweave.cloud/type: gb200-4x-l
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      volumes:
+        - name: int4-source
+          persistentVolumeClaim:
+            claimName: k26-source-int4
+            readOnly: true
+        - name: ckpt
+          persistentVolumeClaim:
+            claimName: k26-nvfp4-ckpt
+        - name: local
+          hostPath:
+            path: /mnt/local
+            type: DirectoryOrCreate
+        - name: scripts
+          configMap:
+            name: quanty-k26-dequant-ptq-scripts
+            # Must contain run-k26-ptq-dequant.sh, example_utils.py,
+            # patch-modelopt-043-kimi.py, inspect-nvfp4-export.py, and
+            # the K2.6 recipe. The launcher fails closed if any required
+            # shim or export inspector is missing.
+            defaultMode: 0555
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 256Gi
+      containers:
+        - name: ptq
+          image: nvcr.io/nvidia/pytorch:25.11-py3
+          imagePullPolicy: IfNotPresent
+          workingDir: /work
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: HF_HOME
+              value: /mnt/local/hf_cache
+            - name: TRANSFORMERS_CACHE
+              value: /mnt/local/hf_cache
+            - name: HF_HUB_ENABLE_HF_TRANSFER
+              value: "1"
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: expandable_segments:True
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: k26-hf-secret
+                  key: HF_TOKEN
+                  optional: true
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: quanty-s3-creds
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: quanty-s3-creds
+                  key: AWS_SECRET_ACCESS_KEY
+            - name: AWS_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: quanty-s3-creds
+                  key: AWS_REGION
+            - name: AWS_ENDPOINT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: quanty-s3-creds
+                  key: AWS_ENDPOINT_URL
+            - name: MODEL_ID
+              value: moonshotai/Kimi-K2.6
+            - name: SOURCE_DIR
+              value: /source/int4/Kimi-K2.6-source-int4
+            - name: MODEL_DIR
+              value: /mnt/local/models/Kimi-K2.6-source-int4
+            - name: S3_OUTPUT_PREFIX
+              value: s3://infr/test/ace/quants
+            - name: QFORMAT
+              value: nvfp4_mlp_only
+            - name: RECIPE
+              value: /scripts/k26-nvfp4_mlp_only-fp8_kv.yaml
+            - name: KV_QFORMAT
+              value: fp8
+            - name: CALIB_DATASET
+              value: cnn_dailymail
+            - name: CALIB_SIZE
+              value: "512"
+            - name: CALIB_SEQ
+              value: "512"
+            - name: BATCH_SIZE
+              value: "1"
+            - name: INFERENCE_TP
+              value: "4"
+            - name: USE_SEQ_DEVICE_MAP
+              value: "1"
+            - name: GPU_MAX_MEM_PERCENTAGE
+              value: "0.88"
+            - name: MODELOPT043_USE_SEQUENTIAL
+              value: "0"
+            - name: MODELOPT_MOE_CALIB_TOKENS_PER_EXPERT
+              value: "64"
+            - name: MODELOPT_MOE_CALIB_TOKEN_CHUNK
+              value: "2048"
+            - name: UPLOAD_TO_HF
+              value: "0"
+          resources:
+            limits:
+              nvidia.com/gpu: 4
+              memory: 900Gi
+              cpu: 64
+            requests:
+              nvidia.com/gpu: 4
+              memory: 800Gi
+              cpu: 48
+          volumeMounts:
+            - name: int4-source
+              mountPath: /source/int4
+              readOnly: true
+            - name: ckpt
+              mountPath: /work
+            - name: local
+              mountPath: /mnt/local
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+            - name: shm
+              mountPath: /dev/shm
+          command:
+            - /bin/bash
+            - /scripts/run-k26-ptq-dequant.sh

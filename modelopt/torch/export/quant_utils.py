@@ -94,7 +94,11 @@ def get_scaling_factor_from_weight(weight, group_size) -> torch.tensor:
 
     # Let's filter the zeros in the scaling factor if the weights are zero
     # to avoid the divided-by-zero error..
-    weights_scaling_factor[weights_scaling_factor == 0] = 1.0
+    weights_scaling_factor = torch.where(
+        weights_scaling_factor == 0,
+        torch.ones_like(weights_scaling_factor),
+        weights_scaling_factor,
+    )
 
     return weights_scaling_factor
 

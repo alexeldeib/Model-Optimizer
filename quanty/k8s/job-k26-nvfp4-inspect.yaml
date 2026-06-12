@@ -1,0 +1,103 @@
+---
+# CPU-only diagnostics for a K2.6 NVFP4 candidate export on k26-nvfp4-ckpt.
+#
+# Before applying this Job, publish the current local inspector script:
+#
+#   kubectl --context cw4637-dev-us-e-01a -n ace-inference delete configmap \
+#     quanty-k26-nvfp4-inspect-scripts --ignore-not-found
+#   kubectl --context cw4637-dev-us-e-01a -n ace-inference create configmap \
+#     quanty-k26-nvfp4-inspect-scripts \
+#     --from-file=inspect-nvfp4-export.py=quanty/scripts/inspect-nvfp4-export.py \
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: quanty-k26-nvfp4-inspect
+  namespace: ace-inference
+  labels:
+    app: quanty-k26-nvfp4-inspect
+    workstream: k26-nvfp4-quality-debug
+    owner: aeldeib
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels:
+        app: quanty-k26-nvfp4-inspect
+        owner: aeldeib
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: inference-backends-image-pull-secret
+      volumes:
+        - name: ckpt
+          persistentVolumeClaim:
+            claimName: k26-nvfp4-ckpt
+        - name: scripts
+          configMap:
+            name: quanty-k26-nvfp4-inspect-scripts
+            defaultMode: 0555
+      containers:
+        - name: inspect
+          image: docker.cloudsmith.io/coreweave/infr-dev/quanty-modelopt:dev
+          imagePullPolicy: IfNotPresent
+          workingDir: /work
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: MODEL_DIR
+              value: /work/quanty/exports/REPLACE_WITH_RUN_ID
+            - name: MODEL_LABEL
+              value: REPLACE_WITH_RUN_ID
+            - name: OUT_ROOT
+              value: /work/quanty/exports/REPLACE_WITH_RUN_ID/diagnostics
+            - name: INSPECT_LAYERS
+              value: auto
+          resources:
+            requests:
+              cpu: 4
+              memory: 32Gi
+            limits:
+              cpu: 8
+              memory: 64Gi
+          volumeMounts:
+            - name: ckpt
+              mountPath: /work
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+          command:
+            - bash
+            - -lc
+            - |
+              set -euo pipefail
+
+              if [[ "${MODEL_LABEL}" == REPLACE_WITH* || "${MODEL_DIR}" == *REPLACE_WITH* || "${OUT_ROOT}" == *REPLACE_WITH* ]]; then
+                  echo "Set MODEL_LABEL, MODEL_DIR, and OUT_ROOT to a completed export before launching" >&2
+                  exit 64
+              fi
+
+              if ! python - <<'PY'
+              try:
+                  import safetensors  # noqa: F401
+              except Exception:
+                  raise SystemExit(1)
+              PY
+              then
+                  pip install --quiet --no-cache-dir safetensors
+              fi
+
+              run_id="$(date -u +%Y%m%dT%H%M%SZ)"
+              out_dir="${OUT_ROOT}/nvfp4-inspect-${run_id}"
+              python /scripts/inspect-nvfp4-export.py \
+                  --model-dir "${MODEL_DIR}" \
+                  --out-dir "${out_dir}" \
+                  --layers "${INSPECT_LAYERS}" \
+                  --attrs input_scale,weight_scale_2 \
+                  --expected-experts 384 \
+                  --expected-moe-layers 60 \
+                  --expected-kv-cache fp8 \
+                  --allow-shared-experts \
+                  --allow-layer0-mlp \
+                  --fail-on-warnings \
+                  --model-label "${MODEL_LABEL}"

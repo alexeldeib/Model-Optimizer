@@ -132,6 +132,92 @@ def _check_moe_calibration_complete(quantizer, parallel_state):
             )
 
 
+def _dtype_from_name(dtype_name: str) -> torch.dtype:
+    """Resolve a ``str(torch.dtype)`` value back to a torch dtype."""
+    return getattr(torch, dtype_name.removeprefix("torch."))
+
+
+def _sync_amax_across_distributed_group(
+    quantizer: TensorQuantizer | SequentialQuantizer,
+    parallel_group: DistributedProcessGroup,
+):
+    """Synchronize amax while keeping collective order identical across ranks.
+
+    Sparse MoE calibration with natural routing can leave a routed expert unseen
+    on one rank while another rank collected an amax for that expert. Calling
+    ``all_reduce`` only on ranks that have ``_amax`` causes the default process
+    group to enter different collective sequences and hang. When at least one
+    rank has an amax, synthesize a zero neutral value on ranks that do not, then
+    run the usual MAX reduction from every rank in the group.
+    """
+    if isinstance(quantizer, SequentialQuantizer):
+        for _q in quantizer:
+            _sync_amax_across_distributed_group(_q, parallel_group)
+        return
+
+    if not quantizer.is_enabled:
+        return
+
+    if not parallel_group.is_initialized():
+        return
+
+    amax = getattr(quantizer, "_amax", None)
+    group_backend = str(torch.distributed.get_backend(parallel_group.group)).lower()
+    if "nccl" in group_backend and torch.cuda.is_available():
+        flag_device = torch.device("cuda", torch.cuda.current_device())
+    elif amax is not None:
+        flag_device = amax.device
+    else:
+        flag_device = torch.device("cpu")
+
+    local_present = torch.tensor(
+        1 if amax is not None else 0,
+        dtype=torch.int32,
+        device=flag_device,
+    )
+    global_present = local_present.clone()
+    torch.distributed.all_reduce(
+        global_present,
+        op=torch.distributed.ReduceOp.SUM,
+        group=parallel_group.group,
+    )
+    present_count = int(global_present.item())
+    if present_count == 0:
+        return
+
+    if present_count == parallel_group.world_size():
+        quantizer.sync_amax_across_distributed_group(parallel_group)
+        return
+
+    local_meta = None
+    if amax is not None:
+        local_meta = {
+            "shape": tuple(amax.shape),
+            "dtype": str(amax.dtype),
+            "device_type": amax.device.type,
+        }
+
+    all_meta = DistributedProcessGroup.get_dist_syncd_obj(
+        local_meta, parallel_group, lambda objs: objs
+    )
+    present_meta = [meta for meta in all_meta if meta is not None]
+    ref = present_meta[0]
+    if any(meta != ref for meta in present_meta):
+        raise RuntimeError(f"Mismatched amax metadata across ranks: {present_meta}")
+
+    if amax is None:
+        device = torch.device(
+            "cuda", torch.cuda.current_device()
+        ) if ref["device_type"] == "cuda" else torch.device(ref["device_type"])
+        quantizer.amax = torch.zeros(
+            ref["shape"],
+            dtype=_dtype_from_name(ref["dtype"]),
+            device=device,
+        )
+
+    quantizer.sync_amax_across_distributed_group(parallel_group)
+
+
 @torch.no_grad()
 def max_calibrate(
     model: nn.Module,
@@ -166,12 +252,11 @@ def max_calibrate(
     if not distributed_sync:
         return
 
-    # Check MoE calibration completeness before sync
-    for name, module in model.named_modules():
-        if isinstance(module, QuantModule) and _has_expert_parallelism(module):
-            for child in module.children():
-                if isinstance(child, (TensorQuantizer, SequentialQuantizer)):
-                    _check_moe_calibration_complete(child, module.parallel_state)
+    # Sparse MoE routing can legitimately leave an expert unseen on one rank
+    # while another rank observed it, or leave very rare experts unseen globally.
+    # `_sync_amax_across_distributed_group` keeps partial-rank cases collective-safe.
+    # Strict recipes that force full expert coverage validate missing input
+    # amax values before export instead of synthesizing activation scales.
 
     def sync_quantizer_amax_across_dp_ep(quantizer, parallel_state):
         """Synchronize the amax across all ranks in the data parallel and expert parallel groups."""
@@ -179,9 +264,8 @@ def max_calibrate(
             for _q in quantizer:
                 sync_quantizer_amax_across_dp_ep(_q, parallel_state)
             return
-        if getattr(quantizer, "_amax", None) is not None:
-            quantizer.sync_amax_across_distributed_group(parallel_state.data_parallel_group)
-            quantizer.sync_amax_across_distributed_group(parallel_state.expert_model_parallel_group)
+        _sync_amax_across_distributed_group(quantizer, parallel_state.data_parallel_group)
+        _sync_amax_across_distributed_group(quantizer, parallel_state.expert_model_parallel_group)
         # TODO: create sync_bias_across_distributed_group
 
     # Step 2:Sync amax across data parallelism
@@ -229,8 +313,8 @@ def max_calibrate(
             if getattr(quantizer.block_sizes, "type", None) == "dynamic":
                 return
 
-        if quantizer.axis in axes_for_sync and quantizer.amax is not None:
-            quantizer.sync_amax_across_distributed_group(parallel_state.tensor_parallel_group)
+        if quantizer.axis in axes_for_sync:
+            _sync_amax_across_distributed_group(quantizer, parallel_state.tensor_parallel_group)
 
     # Step 2: Sync amax across relevant parallelism (such as TP / EP)
     for name, module in model.named_modules():
@@ -275,9 +359,9 @@ def max_calibrate(
             # We only support KVCache quantization with scalar per-tensor states for now (NVFP4 & FP8 KV cache)
             # So we should sync amax across DP and TP for these quantizers (DP is already synced from above)
             for quantizer in [module.k_bmm_quantizer, module.v_bmm_quantizer]:
-                if isinstance(quantizer, TensorQuantizer) and quantizer.amax is not None:
-                    quantizer.sync_amax_across_distributed_group(
-                        module.parallel_state.tensor_parallel_group
+                if isinstance(quantizer, TensorQuantizer):
+                    _sync_amax_across_distributed_group(
+                        quantizer, module.parallel_state.tensor_parallel_group
                     )
 
 
@@ -742,6 +826,10 @@ def local_hessian_calibrate(
 
 def enable_stats_collection(model: nn.Module):
     """Enable stats collection for all quantizers in the model."""
+    for _, module in model.named_modules():
+        if getattr(module, "_moe_calib_experts_ratio", None) is not None:
+            module._modelopt_moe_calibrating = True
+
     for name, module in model.named_modules():
         if isinstance(module, TensorQuantizer) and not module._disabled:
             if module._use_constant_amax:
@@ -758,6 +846,10 @@ def enable_stats_collection(model: nn.Module):
 
 def finish_stats_collection(model: nn.Module, method: str | None = None, **kwargs):
     """Finish stats collection for all quantizers in the model."""
+    for _, module in model.named_modules():
+        if hasattr(module, "_modelopt_moe_calibrating"):
+            module._modelopt_moe_calibrating = False
+
     for _, module in model.named_modules():
         if not isinstance(module, TensorQuantizer) or module._disabled:
             continue

@@ -1,95 +1,36 @@
-# K2.6-aware NVFP4 experts-only + FP8 KV recipe.
+# K2.6 NVFP4 recipe aligned with the experts-only K2.6 INT4 source layout.
 #
-# Architecture facts that drive the selectors:
-#   * K2.6 = KimiK25ForConditionalGeneration wrapping DeepseekV3ForCausalLM
-#     (text backbone) + MoonViT (vision encoder).
-#   * 61 layers, hidden 7168, 384 routed experts + 1 shared, top_k=8.
-#   * MLA attention: q_lora_rank=1536, kv_lora_rank=512.  Up-proj is sensitive
-#     to quantization (recovers low-rank latent into full QKV); keep it BF16.
-#   * first_k_dense_replace=1 -> layer 0 is dense MLP, layers 1-60 use MoE.
-#
-# Why this differs from the upstream nvfp4_experts_only-fp8_kv recipe:
-#   * Adds DeepSeek-style MoE expert path selectors
-#     (`*mlp.experts.*`, `*shared_experts.*`).
-#   * Explicitly skips the shared expert (always-active; quant noise compounds).
-#   * Skips MLA up-proj quantizers (`*kv_a_proj_with_mqa*`, `*kv_b_proj*`,
-#     `*q_a_proj*`, `*q_b_proj*`) -- low-rank to full QKV is precision-sensitive.
-#   * Skips the entire MoonViT vision encoder (`*vision*`, `*vit*`) -- visual
-#     features mismatched against the LLM token stream when quantized.
-#   * Skips the gate/router (`*mlp.gate*`) -- routing decisions need precision.
-#   * GPTQ + layerwise calibration with checkpoint resume.
-#
-# Inherits the layerwise=true mechanism from
-# modelopt/torch/quantization/utils/layerwise_calib.py via the
-# `algorithm.layerwise: true` toggle.
+# The mounted K2.6 INT4 source used by the dequant verifier contains packed
+# weights only under language_model.*.mlp.experts.*.  lm_head, vision,
+# projector, dense layer-0 MLP, shared experts, routers, and gates are plain
+# tensors.  This recipe must therefore stay on the upstream
+# nvfp4_experts_only-fp8_kv selector shape, with only K2.6 calibration
+# coverage controls added.
 metadata:
   recipe_type: ptq
   description: >
-    Kimi K2.6 NVFP4 experts-only (W4A4) + FP8 KV; MLA up-proj kept BF16,
-    shared expert kept BF16, MoonViT kept BF16; GPTQ layerwise calibration
-    with shared-FS checkpoint resume.
+    Kimi K2.6 NVFP4 routed-expert-only W4A4 + FP8 KV cache;
+    self-attention, lm_head, projector, vision, layer-0 dense MLP,
+    shared experts, router/gate, and embeddings remain native.
 
 quantize:
   algorithm:
-    # Switched from gptq -> max for K2.6 multinode validation.  GPTQ's
-    # multi-replay Hessian collection re-triggers the transformers 5.x
-    # DynamicCache cache-replay shape mismatch we first hit on Qwen2.5
-    # in Phase 0 (now fixed via cache-strip in modelopt's
-    # layerwise_calib.py).  Max is faster and good enough for the
-    # first end-to-end validation; GPTQ stays as a follow-up.
-    #
-    # ``layerwise_checkpoint_dir`` intentionally omitted: each K2.6
-    # layer's input activations + cached state is ~30 GiB; 61 layers
-    # = ~1.8 TiB which exceeds the 1.5 TiB k26-nvfp4-ckpt PVC.  No
-    # resume capability for now -- calibration runs straight through
-    # in one shot.  If we need resume for K2.6 we'll need either a
-    # bigger PVC or a checkpoint format that drops the activations
-    # and only keeps the per-layer quantizer state.
     method: max
     layerwise: true
-    # Skip ``sync_moe_expert_amax`` (the post-calibration broadcast that
-    # element-wise-maxes every expert's input_quantizer.amax across all
-    # experts in a layer, destroying per-expert specialization).  Setting
-    # this knob to ANY non-None value makes
-    # ``_QuantSparseSequentialMoe.layer_sync_moe_local_experts_amax``
-    # early-return -- see
-    # modelopt/torch/quantization/plugins/huggingface.py:599
-    # ("if self._moe_calib_experts_ratio is not None: return").
-    #
-    # The previous attempt set this to ``1.0`` (full coverage), which
-    # forces ``top_k = num_experts = 384`` during the calibration forward.
-    # That route every token through every expert -- so every expert
-    # sees the SAME hidden_state at gate_proj input (the routing weight
-    # is applied to expert OUTPUT, not input), and MAX calibration gives
-    # IDENTICAL amax across all experts.  Verified empirically
-    # 2026-04-27 22:00Z: with ratio=1.0, layer 30 gate/up_proj.input_scale
-    # = 9.954543e-05 across experts.{0..383} (n=384 unique=1 std=0).
-    # That produces a checkpoint that loads cleanly under FLASHINFER_CUTLASS
-    # NVFP4 MoE but lm-eval scores at random chance because the
-    # absolute magnitude is 5x smaller than NVIDIA's reference
-    # (input_scale = amax / (6*448) export formula -> our amax ~0.27
-    # vs nvidia/Kimi-K2.5-NVFP4 amax ~1.34).
-    #
-    # Setting this to ``0.001`` keeps natural top_k=8 routing during
-    # calibration (``max(original_top_k=8, round(num_experts*0.001)=0)
-    # = 8``) so each expert sees ONLY the tokens routed to it -- giving
-    # per-expert amax variation that matches nvidia/Kimi-K2.5-NVFP4's
-    # published 4.77e-4 / 5.00e-4 / 5.06e-4 pattern for experts 0/1/10.
-    #
-    # Cost: dual calibration forwards (the "calib" and "actual" forward
-    # in plugins/huggingface.py:537-587) but both now at top_k=8, so
-    # roughly 2x the compute of a single top_k=8 calibration.  Statistical
-    # power: with CALIB_SAMPLES=512 and top_k=8 routing across 384
-    # experts, each expert sees ~512*2048*8/384 = 21k tokens on
-    # average (assuming balanced routing) -- enough for a stable amax.
-    moe_calib_experts_ratio: 0.001
+    # K2.6 natural top_k=8 routing collapses to a tiny expert subset in
+    # deeper layers: with 2048 cnn_dailymail samples, only 2004/23040 routed
+    # expert slots were touched.  Force full expert coverage during the
+    # calibration-only pass, then run the normal top_k path for model outputs.
+    # Setting this also disables sync_moe_expert_amax(), avoiding ModelOpt's
+    # default post-calibration rewrite of every expert input amax.
+    moe_calib_experts_ratio: 1.0
   quant_cfg:
-    # 1) Disable everything by default.  Selectors below opt-in.
     - quantizer_name: '*'
       enable: false
 
-    # 2) NVFP4 W4A4 on routed expert weights (DeepseekV3-style path).
-    - quantizer_name: '*mlp.experts.*weight_quantizer'
+    # Routed expert coverage only.  Do not broaden this to *mlp*: that also
+    # catches plain vision/projector/layer-0/shared-expert modules in K2.6.
+    - quantizer_name: '*mlp.experts*weight_quantizer'
       enable: true
       cfg:
         block_sizes:
@@ -97,7 +38,7 @@ quantize:
           type: dynamic
           scale_bits: e4m3
         num_bits: e2m1
-    - quantizer_name: '*mlp.experts.*input_quantizer'
+    - quantizer_name: '*mlp.experts*input_quantizer'
       enable: true
       cfg:
         block_sizes:
@@ -106,56 +47,80 @@ quantize:
           scale_bits: e4m3
         num_bits: e2m1
 
-    # 3) FP8 KV cache (matches NVIDIA's published Kimi-K2.5-NVFP4).
-    - quantizer_name: '*[kv]_bmm_quantizer'
+    # Keep the generic sparse-MoE selectors from the upstream recipe so
+    # the file remains usable for the Qwen/Mixtral-style smoke path.
+    - quantizer_name: '*block_sparse_moe*weight_quantizer'
       enable: true
       cfg:
-        num_bits: e4m3
+        block_sizes:
+          -1: 16
+          type: dynamic
+          scale_bits: e4m3
+        num_bits: e2m1
+    - quantizer_name: '*block_sparse_moe*input_quantizer'
+      enable: true
+      cfg:
+        block_sizes:
+          -1: 16
+          type: dynamic
+          scale_bits: e4m3
+        num_bits: e2m1
 
-    # 4) Explicit skips for precision-sensitive paths.
-    #    Shared expert: always-active, quant noise compounds.
-    - quantizer_name: '*mlp.shared_experts.*'
+    # Explicit exclusions. The first disable-all entry above already keeps
+    # unmatched modules native; these entries make the K2.6 expert-only intent
+    # visible in exported quantization metadata.
+    - quantizer_name: '*self_attn*'
       enable: false
-    - quantizer_name: '*mlp.shared_expert_gate*'
-      enable: false
-    #    MoE router / gate: routing decisions must stay precise.
-    - quantizer_name: '*mlp.gate*'
-      enable: false
-    - quantizer_name: '*router*'
-      enable: false
-    #    MLA: q_lora / kv_lora down-up projections.  Up-proj recovers full
-    #    QKV from a low-rank latent; quant errors compound across heads.
-    - quantizer_name: '*q_a_proj*'
-      enable: false
-    - quantizer_name: '*q_b_proj*'
-      enable: false
-    - quantizer_name: '*kv_a_proj_with_mqa*'
-      enable: false
-    - quantizer_name: '*kv_b_proj*'
-      enable: false
-    #    MoonViT vision tower -- entire path stays BF16.
     - quantizer_name: '*vision*'
+      enable: false
+    - quantizer_name: '*vision_tower*'
       enable: false
     - quantizer_name: '*vit*'
       enable: false
     - quantizer_name: '*moon_vit*'
       enable: false
-    #    Embedding / output head.
+    - quantizer_name: '*block_sparse_moe.gate*'
+      enable: false
+    - quantizer_name: '*linear_attn.conv1d*'
+      enable: false
     - quantizer_name: '*lm_head*'
+      enable: false
+    - quantizer_name: '*mixer.conv1d*'
+      enable: false
+    - quantizer_name: '*mlp.gate*'
+      enable: false
+    - quantizer_name: '*mlp.gate.*'
+      enable: false
+    - quantizer_name: '*mlp.shared_experts*'
+      enable: false
+    - quantizer_name: '*mlp.shared_expert_gate.*'
       enable: false
     - quantizer_name: '*output_layer*'
       enable: false
+    - quantizer_name: '*proj_out.*'
+      enable: false
+    - quantizer_name: '*router*'
+      enable: false
     - quantizer_name: 'output.*'
       enable: false
+    - parent_class: 'nn.BatchNorm1d'
+      quantizer_name: '*'
+      enable: false
+    - parent_class: 'nn.BatchNorm2d'
+      quantizer_name: '*'
+      enable: false
+    - parent_class: 'nn.BatchNorm3d'
+      quantizer_name: '*'
+      enable: false
+    - parent_class: 'nn.LeakyReLU'
+      quantizer_name: '*'
+      enable: false
 
-    # Note: norms / nonlinearities are NOT explicitly listed here.
-    # ``parent_class: 'nn.RMSNorm'`` would be the natural selector but
-    # modelopt's set_quantizer_by_cfg validates that any parent_class
-    # string resolves in QuantModuleRegistry (even for ``enable: false``).
-    # nn.RMSNorm has no registered quantized equivalent -> ValueError at
-    # apply_mode (raised on K2.6's first attempt).  The default
-    # ``quantizer_name: '*' enable: false`` at the top of this list
-    # already disables every quantizer; the explicit opt-ins above
-    # (``*mlp.experts.*weight_quantizer`` etc.) don't match norm/silu
-    # modules, so they stay disabled without needing a parent_class
-    # selector.
+    # Keep the recipe self-contained for FP8 KV cache, matching the
+    # upstream nvfp4_experts_only-fp8_kv recipe. This must remain after
+    # the broad *self_attn* exclusion above, otherwise the attention
+    # exclusion disables k_bmm_quantizer/v_bmm_quantizer again.
+    - quantizer_name: '*[kv]_bmm_quantizer'
+      enable: true
+      cfg:
+        num_bits: e4m3

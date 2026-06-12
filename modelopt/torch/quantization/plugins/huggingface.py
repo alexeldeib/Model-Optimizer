@@ -17,6 +17,7 @@
 
 import inspect
 import logging
+import os
 import warnings
 from contextlib import contextmanager
 from functools import partial
@@ -489,19 +490,24 @@ class _QuantSparseSequentialMoe(QuantModule):
     def _setup(self):
         self._moe_calib_experts_ratio = None
         self._token_counting_initialized = False
+        self._count_expert_tokens = False
+
+    def _resolve_num_experts(self) -> int:
+        for obj in [getattr(self, "gate", None), self, getattr(self, "experts", None)]:
+            if obj is None:
+                continue
+            for attr in ("num_experts", "n_routed_experts"):
+                if hasattr(obj, attr):
+                    return int(getattr(obj, attr))
+        experts = getattr(self, "experts", None)
+        if isinstance(experts, nn.ModuleList):
+            return len(experts)
+        return 0
 
     def _init_token_counting(self):
         """Lazy-init token counting infra (buffer + gate hook). Called once from forward."""
         self._token_counting_initialized = True
-        num_experts = 0
-        for obj in [getattr(self, "gate", None), self, getattr(self, "experts", None)]:
-            if obj is not None:
-                for attr in ("num_experts", "n_routed_experts"):
-                    if hasattr(obj, attr):
-                        num_experts = getattr(obj, attr)
-                        break
-            if num_experts:
-                break
+        num_experts = self._resolve_num_experts()
 
         if num_experts == 0:
             warnings.warn(
@@ -515,7 +521,6 @@ class _QuantSparseSequentialMoe(QuantModule):
             torch.zeros(num_experts, dtype=torch.long, device=next(self.parameters()).device),
             persistent=False,
         )
-        self._count_expert_tokens = False
         if hasattr(self, "gate"):
             self.gate.register_forward_hook(self._gate_forward_hook)
 
@@ -526,6 +531,14 @@ class _QuantSparseSequentialMoe(QuantModule):
             if isinstance(output, tuple) and len(output) >= 3:
                 # v5.x TopKRouter: returns (logits, scores, indices)
                 indices = output[2]
+            elif (
+                isinstance(output, tuple)
+                and len(output) >= 1
+                and isinstance(output[0], torch.Tensor)
+                and not torch.is_floating_point(output[0])
+            ):
+                # Kimi/DeepSeek-style gates return (topk_idx, topk_weight).
+                indices = output[0]
             else:
                 # v4.x nn.Linear gate: returns logits tensor
                 logits = output if not isinstance(output, tuple) else output[0]
@@ -534,53 +547,179 @@ class _QuantSparseSequentialMoe(QuantModule):
             counts = torch.bincount(indices.reshape(-1), minlength=self.expert_token_count.shape[0])
             self.expert_token_count += counts.to(self.expert_token_count.device)
 
+    def _moe_calib_token_chunk_size(self) -> int:
+        value = os.getenv("MODELOPT_MOE_CALIB_TOKEN_CHUNK", "2048")
+        try:
+            return max(1, int(value))
+        except ValueError:
+            warnings.warn(
+                "MODELOPT_MOE_CALIB_TOKEN_CHUNK must be an integer; using 2048.",
+                stacklevel=2,
+            )
+            return 2048
+
+    def _moe_calib_tokens_per_expert(self) -> int:
+        value = os.getenv("MODELOPT_MOE_CALIB_TOKENS_PER_EXPERT", "64")
+        try:
+            return max(1, int(value))
+        except ValueError:
+            warnings.warn(
+                "MODELOPT_MOE_CALIB_TOKENS_PER_EXPERT must be an integer; using 64.",
+                stacklevel=2,
+            )
+            return 64
+
+    def _expert_candidate_token_indices(
+        self, flat_hidden_states: torch.Tensor, num_experts: int
+    ) -> list[torch.Tensor] | None:
+        """Return top gate-score token indices per expert for bounded forced calibration."""
+
+        gate = getattr(self, "gate", None)
+        gate_weight = getattr(gate, "weight", None)
+        if gate is None or gate_weight is None or gate_weight.ndim != 2:
+            return None
+        if gate_weight.shape[0] != num_experts or gate_weight.shape[1] != flat_hidden_states.shape[-1]:
+            return None
+
+        with torch.no_grad():
+            scores = linear(
+                flat_hidden_states.float(),
+                gate_weight.detach().float().to(flat_hidden_states.device),
+                None,
+            )
+            scoring_func = getattr(gate, "scoring_func", None)
+            if scoring_func == "sigmoid":
+                scores = scores.sigmoid()
+            elif scoring_func == "softmax":
+                scores = scores.softmax(dim=-1)
+
+            correction_bias = getattr(gate, "e_score_correction_bias", None)
+            if correction_bias is not None:
+                scores = scores + correction_bias.detach().float().to(scores.device).unsqueeze(0)
+            raw_scores = scores
+
+            n_group = getattr(gate, "n_group", getattr(gate, "n_groups", None))
+            topk_group = getattr(gate, "topk_group", getattr(gate, "topk_groups", None))
+            if n_group is not None and topk_group is not None and num_experts % n_group == 0:
+                group_size = num_experts // n_group
+                group_scores = scores.view(-1, n_group, group_size).topk(
+                    min(2, group_size), dim=-1
+                )[0].sum(dim=-1)
+                group_idx = torch.topk(
+                    group_scores, k=min(topk_group, n_group), dim=-1, sorted=False
+                )[1]
+                group_mask = torch.zeros_like(group_scores, dtype=torch.bool)
+                group_mask.scatter_(1, group_idx, True)
+                score_mask = group_mask.unsqueeze(-1).expand(-1, n_group, group_size).reshape(
+                    -1, num_experts
+                )
+                scores = scores.masked_fill(~score_mask, float("-inf"))
+
+            tokens_per_expert = min(self._moe_calib_tokens_per_expert(), flat_hidden_states.shape[0])
+            if tokens_per_expert <= 0:
+                return None
+
+            candidate_indices = []
+            for expert_idx in range(num_experts):
+                expert_scores = scores[:, expert_idx]
+                valid_token_indices = torch.nonzero(
+                    torch.isfinite(expert_scores), as_tuple=False
+                ).flatten()
+                if valid_token_indices.numel() == 0:
+                    expert_scores = raw_scores[:, expert_idx]
+                    valid_token_indices = torch.arange(
+                        expert_scores.shape[0], device=expert_scores.device
+                    )
+                expert_scores = expert_scores.index_select(0, valid_token_indices)
+                k = min(tokens_per_expert, expert_scores.numel())
+                selected = torch.topk(expert_scores, k=k, dim=0, sorted=False).indices
+                candidate_indices.append(valid_token_indices.index_select(0, selected))
+            return candidate_indices
+
+    def _calibrate_all_sequential_experts(self, hidden_states: torch.Tensor) -> bool:
+        """Calibrate every sequential expert without materializing all routed outputs.
+
+        Full top-k calibration on Kimi/DeepSeek would route every token to
+        every expert and materialize a ``[tokens, experts, hidden]`` tensor in
+        ``moe_infer``.  Instead, run each expert directly on a bounded set of
+        high gate-score candidate tokens.  This still produces nonzero expert
+        activation scales, but avoids forcing every expert's gate/up scale to
+        the layer-global amax from all calibration tokens.
+        """
+
+        experts = getattr(self, "experts", None)
+        if not hasattr(experts, "__iter__"):
+            return False
+
+        if not self._token_counting_initialized:
+            self._init_token_counting()
+
+        flat_hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+        num_experts = self._resolve_num_experts()
+        candidate_indices = self._expert_candidate_token_indices(flat_hidden_states, num_experts)
+        chunk_size = self._moe_calib_token_chunk_size()
+        count_source = "gate_top_tokens" if candidate_indices is not None else "all_tokens"
+
+        with torch.no_grad():
+            for expert_idx, expert in enumerate(experts):
+                if expert is None:
+                    continue
+                if candidate_indices is None:
+                    expert_inputs = flat_hidden_states
+                    token_count = flat_hidden_states.shape[0]
+                else:
+                    expert_inputs = flat_hidden_states.index_select(0, candidate_indices[expert_idx])
+                    token_count = expert_inputs.shape[0]
+                for chunk in expert_inputs.split(chunk_size, dim=0):
+                    expert_output = expert(chunk)
+                    del expert_output
+                if hasattr(self, "expert_token_count") and expert_idx < self.expert_token_count.numel():
+                    self.expert_token_count[expert_idx] += token_count
+            self._expert_token_count_source = count_source
+
+        return True
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self._moe_calib_experts_ratio is None:
             return super().forward(hidden_states)
 
-        is_calib = any(getattr(m, "_if_calib", False) for m in self.experts.modules())
+        is_calib = getattr(self, "_modelopt_moe_calibrating", False) or any(
+            getattr(m, "_if_calib", False) for m in self.experts.modules()
+        )
 
         # During calibration, forward all tokens to a larger fraction of experts to improve
         # calibration coverage, then re-run with the original top_k for actual outputs.
         if is_calib:
-            # Skip counting when all experts are calibrated (ratio == 1.0).
-            self._count_expert_tokens = self._moe_calib_experts_ratio < 1.0
-            if self._count_expert_tokens and not self._token_counting_initialized:
-                self._init_token_counting()
-            if TRANSFORMERS_VERSION_GE_5_0:
-                assert hasattr(self, "gate") and hasattr(self.gate, "top_k")
-                original_top_k = self.gate.top_k
-                self.gate.top_k = max(
-                    original_top_k, round(self.gate.num_experts * self._moe_calib_experts_ratio)
-                )
-                super().forward(hidden_states)
-                self.gate.top_k = original_top_k
-            else:
-                # Path for transformers<5.0
-                if hasattr(self, "gate") and hasattr(self.gate, "top_k"):
+            # Count coverage for every configured ratio, including 1.0.
+            # Full-ratio calibration should prove that every expert was
+            # actually exercised instead of relying on the top_k override
+            # semantics by inspection.
+            self._count_expert_tokens = True
+            try:
+                if self._count_expert_tokens and not self._token_counting_initialized:
+                    self._init_token_counting()
+                if TRANSFORMERS_VERSION_GE_5_0:
+                    assert hasattr(self, "gate") and hasattr(self.gate, "top_k")
                     top_k_owner = self.gate
                 else:
-                    top_k_owner = self
+                    top_k_owner = (
+                        self.gate if hasattr(self, "gate") and hasattr(self.gate, "top_k") else self
+                    )
                 original_top_k = top_k_owner.top_k
-                if hasattr(self, "num_experts"):
-                    top_k_owner.top_k = max(
-                        original_top_k, round(self.num_experts * self._moe_calib_experts_ratio)
-                    )
-                elif hasattr(self, "experts"):
-                    num_experts = (
-                        self.experts.num_experts
-                        if hasattr(self.experts, "num_experts")
-                        else len(self.experts)
-                    )
-                    top_k_owner.top_k = max(
-                        original_top_k,
-                        round(num_experts * self._moe_calib_experts_ratio),
-                    )
-                else:
+                num_experts = self._resolve_num_experts()
+                if not num_experts:
                     raise ValueError(f"Could not find num_experts in module {self}")
-                super().forward(hidden_states)
-                top_k_owner.top_k = original_top_k
-            self._count_expert_tokens = False
+                target_top_k = max(original_top_k, round(num_experts * self._moe_calib_experts_ratio))
+                if target_top_k >= num_experts and self._calibrate_all_sequential_experts(hidden_states):
+                    pass
+                else:
+                    top_k_owner.top_k = target_top_k
+                    try:
+                        super().forward(hidden_states)
+                    finally:
+                        top_k_owner.top_k = original_top_k
+            finally:
+                self._count_expert_tokens = False
 
         output = super().forward(hidden_states)
         self._count_expert_tokens = False

@@ -1,24 +1,24 @@
 ---
-# K2.6 NVFP4 multinode PTQ on 6x GB200 nodes (24 GPUs, ~4.4 TB HBM total).
+# K2.6 NVFP4 multinode PTQ on 5x GB200 nodes (20 GPUs, ~3.7 TB HBM total).
 #
-# 4-node attempt (2026-04-27) confirmed OOM at 181/184 GiB during
+# 4-node attempt (2026-04-27) with the stale broad MLP recipe confirmed OOM at 181/184 GiB during
 # _process_quantized_modules even with the per-expert input_scale fix
 # in commit 543273c2b (the fix targets quality, not memory).  Diagnostic
 # prints from commit 4ca081b9f showed entry at allocated=125.8 GiB peak=
 # 166.0 GiB -- 55 GiB headroom for the conversion + state_dict gather
 # segment that needs ~55 GiB.  Doesn't fit at 4-node.
 #
-# 6-node halves per-rank shard from 130 -> 87 GiB, frees ~43 GiB peak,
-# brings the export segment well under the ceiling.
+# 5-node keeps the export/conversion segment below the per-rank ceiling while
+# avoiding the extra GB200 node. Use 6 nodes when available for more headroom.
 #
 # Topology:
-#   * Indexed Job, parallelism=completions=6 -> pods 0..5
-#   * Each pod gets 4x GB200 GPUs (24 GPUs total)
+#   * Indexed Job, parallelism=completions=5 -> pods 0..4
+#   * Each pod gets 4x GB200 GPUs (20 GPUs total)
 #   * Pod-0 is torchrun rendezvous master, reachable via the headless
 #     service DNS as quanty-gb200-k26-mn-ptq-0.<svc>:29500
-#   * Layerwise checkpoint dir on shared PVC means a preempted pod
-#     resumes from the last fully-written layer without redoing the
-#     ~2 hours of GPTQ Hessian collection per layer.
+#   * CHECKPOINT_DIR is still a shared run workspace for scratch files and
+#     diagnostics, but this K2.6 recipe intentionally does not write layerwise
+#     activation checkpoints because they exceed the current PVC budget.
 #
 # Headless service must allow not-ready addresses so workers can
 # resolve the master before any pod transitions to Ready.
@@ -56,13 +56,14 @@ spec:
   # (0..parallelism-1).  k8s 1.27+ also auto-sets hostname to
   # <job-name>-<index>, so workers reach pod-0 via DNS without an
   # init-container peek.
-  parallelism: 6
-  completions: 6
+  parallelism: 5
+  completions: 5
   completionMode: Indexed
-  # 8 = ~2 retries per pod.  The layerwise checkpoint resume picks up
-  # from the last fully-written layer so a single-node failure costs
-  # only the in-flight layer's GPTQ work.
-  backoffLimit: 8
+  # This recipe intentionally omits layerwise checkpointing for K2.6
+  # because the captured activations exceed the PVC budget.  Do not
+  # blindly restart failed containers in-place; preserve the failed pod
+  # logs so NCCL/collective failures can be diagnosed.
+  backoffLimit: 0
   ttlSecondsAfterFinished: 604800
   template:
     metadata:
@@ -70,7 +71,7 @@ spec:
         app: quanty-gb200-k26-mn-ptq
         owner: aeldeib
     spec:
-      restartPolicy: OnFailure
+      restartPolicy: Never
       schedulerName: binpack-scheduler
       priorityClassName: inference-partial-node
       # Subdomain wires pod hostnames into the headless service DNS:
@@ -96,15 +97,26 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 256Gi
-        # Runtime overlay of commit 6d25cbe635 (FSDP-aware
-        # set_expert_quantizer_amax: reads weights inside an
-        # fsdp2_aware_weight_update context so per-expert weight
-        # max-abs is meaningful, not the per-rank shard max).
-        # Avoids docker rebuild for the patched code; once we
-        # validate quality, bake into :dev.
+        # Runtime overlay of the current K2.6 ModelOpt patch set:
+        # sharded FSDP2 load/export, collective-safe amax sync, DeepSeekV3
+        # MoE export detection, and Kimi gate compatibility.
+        # Avoids docker rebuild for the patched code; once validated, bake into :dev.
         - name: modelopt-patch
           configMap:
-            name: modelopt-fsdp-fix-6d25cbe
+            name: modelopt-k26-minimal-fixes
+        # Runtime overlay of the current K2.6 recipe candidate. The docker
+        # :dev tag can lag local recipe commits; mounting this file
+        # guarantees the job uses the K2.6 production MLP-only recipe.
+        - name: k26-recipe
+          configMap:
+            name: quanty-k26-nvfp4-mlponly-recipe
+        - name: ptq-scripts
+          configMap:
+            name: quanty-k26-ptq-scripts
+            # Must contain run-k26-ptq-multinode.sh, patch-k26-modeling.sh,
+            # and inspect-nvfp4-export.py. Rank 0 fails closed if the export
+            # inspector is missing before S3 upload.
+            defaultMode: 0555
       containers:
         - name: ptq
           image: docker.cloudsmith.io/coreweave/infr-dev/quanty-modelopt:dev
@@ -126,6 +138,12 @@ spec:
             - name: NCCL_ASYNC_ERROR_HANDLING
               value: "1"
             - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+              value: "1"
+            - name: TORCH_NCCL_TRACE_BUFFER_SIZE
+              value: "1048576"
+            - name: TORCH_NCCL_DUMP_ON_TIMEOUT
+              value: "1"
+            - name: TORCH_NCCL_DESYNC_DEBUG
               value: "1"
             # Inter-node NCCL needs to bind to the right interface --
             # eth0 is the cluster-routable iface on these nodes per the
@@ -159,7 +177,7 @@ spec:
             - name: NUM_GPUS
               value: "4"
             - name: NNODES
-              value: "6"
+              value: "5"
             - name: MASTER_ADDR
               value: "quanty-gb200-k26-mn-ptq-0.quanty-gb200-k26-mn-rdzv.ace-inference.svc.cluster.local"
             - name: MASTER_PORT
@@ -169,46 +187,38 @@ spec:
             # ---- ptq config ----
             - name: TARGET_MODEL
               value: /source/k26-bf16/Kimi-K2.6-BF16
+            - name: QFORMAT
+              value: nvfp4_mlp_only
             - name: RECIPE
-              value: /opt/quanty/quanty/recipes/k26-nvfp4_experts_only-fp8_kv.yaml
-            - name: CHECKPOINT_DIR
-              value: /work/quanty/checkpoints/k26-nvfp4-mn
-            - name: EXPORT_DIR
-              value: /work/quanty/exports/k26-nvfp4-mn
+              value: /opt/quanty/quanty/recipes/k26-nvfp4_mlp_only-fp8_kv.yaml
+            # Replace this value at launch time, e.g.
+            # k26-nvfp4-mlponly-mn5-$(date -u +%Y%m%dT%H%M%SZ).
+            # The launcher derives CHECKPOINT_DIR, EXPORT_DIR, and
+            # S3_DEST_PREFIX from RUN_ID when those envs are not set.
+            - name: RUN_ID
+              value: REPLACE_WITH_UNIQUE_RUN_ID
             - name: CALIB_DATASET
-              # Match NVIDIA's published nvidia/Kimi-K2.5-NVFP4 recipe
-              # which used cnn_dailymail.  The K2.6 NVFP4 quality
-              # regression observed 2026-04-27 (gsm8k=0%, mmlu=27%
-              # despite recipe-level moe_calib_experts_ratio=1.0 fix)
-              # was traced to amax magnitudes ~5x smaller than NVIDIA's
-              # reference (our amax ~0.27 vs theirs ~1.34, derived from
-              # input_scale = amax / (6 * 448) export formula).  Switching
-              # the calibration dataset from nemotron-post-training-dataset-v2
-              # (chat-templated post-training mix) to cnn_dailymail
-              # (raw English news, what NVIDIA used) brings the calibrated
-              # activation distribution into the regime that produces
-              # working FP4 dynamic-block scales without saturating the
-              # FP8 e4m3 anchor.
+              # Match the ModelOpt examples and avoid
+              # introducing a second dataset variable while we isolate
+              # recipe/export correctness.
               value: cnn_dailymail
-            # With moe_calib_experts_ratio dialed down to 0.001 (the
-            # documented escape hatch for skipping the broadcast sync,
-            # see recipe docs), calibration uses natural top_k=8 routing,
-            # not the previous top_k=384 forced expansion.  That means:
-            #   * The cat(outputs, ...) tensor in DeepseekV3MoE.moe_infer
-            #     is back to its top_k=8 footprint (~11 GiB at BATCH=1
-            #     SEQ_LEN=2048), so we have headroom for BATCH > 1.
-            #   * Each expert now sees ONLY tokens routed to it during
-            #     calibration -- ~21k tokens/expert at SAMPLES=512
-            #     (vs the prior 1M/expert under top_k=384), but with
-            #     genuinely per-expert calibration statistics.
-            # Keeping BATCH=1 / SAMPLES=512 conservatively for now;
-            # increasing BATCH may speed iteration once we confirm
-            # the cnn_dailymail + ratio=0.001 combo recovers quality.
+            # Match the single-node dequant verifier while isolating
+            # FSDP/multinode correctness. Full MoE coverage comes from
+            # moe_calib_experts_ratio=1.0 plus the per-expert token budget
+            # below, not from natural top-k routing breadth.
             - name: CALIB_SAMPLES
               value: "512"
             - name: CALIB_BATCH
               value: "1"
             - name: CALIB_SEQ_LEN
+              value: "512"
+            - name: KV_CACHE_QFORMAT
+              value: fp8
+            - name: REQUIRE_MOE_COVERAGE
+              value: "1"
+            - name: MODELOPT_MOE_CALIB_TOKENS_PER_EXPERT
+              value: "64"
+            - name: MODELOPT_MOE_CALIB_TOKEN_CHUNK
               value: "2048"
             # ---- S3 upload of final export ----
             # ``quanty-s3-creds`` carries the same CW object-store
@@ -239,16 +249,14 @@ spec:
                 secretKeyRef:
                   name: quanty-s3-creds
                   key: AWS_ENDPOINT_URL
-            - name: S3_DEST_PREFIX
-              value: "s3://infr/test/ace/quants/k26-nvfp4-experts-only"
           resources:
             limits:
               nvidia.com/gpu: 4
-              memory: 700Gi
+              memory: 900Gi
               cpu: 64
             requests:
               nvidia.com/gpu: 4
-              memory: 600Gi
+              memory: 800Gi
               cpu: 48
           ports:
             - name: rdzv
@@ -262,11 +270,15 @@ spec:
               mountPath: /work
             - name: shm
               mountPath: /dev/shm
-            # Overlay the two patched modelopt source files via subPath
+            # Overlay the patched modelopt source files via subPath
             # so the rest of the modelopt package on the image is left
-            # alone.  K8s reads both at pod creation; if the ConfigMap
+            # alone.  K8s reads them at pod creation; if the ConfigMap
             # changes mid-run, kubelet does NOT propagate the update --
             # which is what we want here (avoids stale-during-export).
+            - name: modelopt-patch
+              mountPath: /opt/quanty/modelopt/torch/quantization/model_calib.py
+              subPath: model_calib.py
+              readOnly: true
             - name: modelopt-patch
               mountPath: /opt/quanty/modelopt/torch/export/layer_utils.py
               subPath: layer_utils.py
@@ -274,6 +286,50 @@ spec:
             - name: modelopt-patch
               mountPath: /opt/quanty/modelopt/torch/export/unified_export_hf.py
               subPath: unified_export_hf.py
+              readOnly: true
+            - name: modelopt-patch
+              mountPath: /opt/quanty/modelopt/torch/export/quant_utils.py
+              subPath: quant_utils.py
+              readOnly: true
+            - name: modelopt-patch
+              mountPath: /opt/quanty/modelopt/torch/quantization/plugins/huggingface.py
+              subPath: huggingface.py
+              readOnly: true
+            - name: modelopt-patch
+              mountPath: /opt/quanty/modelopt/torch/quantization/nn/modules/tensor_quantizer.py
+              subPath: tensor_quantizer.py
+              readOnly: true
+            - name: modelopt-patch
+              mountPath: /opt/quanty/modelopt/torch/quantization/qtensor/nvfp4_tensor.py
+              subPath: nvfp4_tensor.py
+              readOnly: true
+            - name: modelopt-patch
+              mountPath: /opt/quanty/modelopt/torch/quantization/utils/core_utils.py
+              subPath: core_utils.py
+              readOnly: true
+            - name: modelopt-patch
+              mountPath: /opt/quanty/modelopt/torch/quantization/utils/layerwise_calib.py
+              subPath: layerwise_calib.py
+              readOnly: true
+            - name: modelopt-patch
+              mountPath: /opt/quanty/examples/llm_ptq/multinode_ptq.py
+              subPath: multinode_ptq.py
+              readOnly: true
+            - name: k26-recipe
+              mountPath: /opt/quanty/quanty/recipes/k26-nvfp4_mlp_only-fp8_kv.yaml
+              subPath: k26-nvfp4_mlp_only-fp8_kv.yaml
+              readOnly: true
+            - name: ptq-scripts
+              mountPath: /opt/quanty/quanty/scripts/run-k26-ptq-multinode.sh
+              subPath: run-k26-ptq-multinode.sh
+              readOnly: true
+            - name: ptq-scripts
+              mountPath: /opt/quanty/quanty/scripts/patch-k26-modeling.sh
+              subPath: patch-k26-modeling.sh
+              readOnly: true
+            - name: ptq-scripts
+              mountPath: /opt/quanty/quanty/scripts/inspect-nvfp4-export.py
+              subPath: inspect-nvfp4-export.py
               readOnly: true
           command:
             - /usr/bin/tini

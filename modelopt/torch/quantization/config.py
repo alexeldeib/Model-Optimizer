@@ -1213,7 +1213,8 @@ class QuantizeAlgorithmConfig(ModeloptBaseConfig):
             " actual inference. NOTE: when set, ``layer_sync_moe_local_experts_amax`` is"
             " disabled so each expert maintains its own calibration statistics. Not"
             " supported for all MoE architectures; currently works with a few HuggingFace"
-            " models such as Mixtral, Qwen3Moe, MiniMax."
+            " models such as Mixtral, Qwen3Moe, MiniMax, and DeepSeek/Kimi-style "
+            "sequential MoEs."
         ),
     )
 

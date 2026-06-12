@@ -424,12 +424,91 @@ def get_dtype(dtype):
     return dtype
 
 
-def _unpack_compressed_linear_weights(model, ckpt_path=None):
-    """Hybrid restoration: restores BF16 layers and fixes expert metadata.
+def _pack_quantized_config_dicts(config) -> list[dict[str, Any]]:
+    """Return mutable pack-quantized config dicts from a HF config object."""
 
-    1. BF16 layers (vision, lm_head) are restored from checkpoint and marked non-compressed.
-    2. INT4 experts stay compressed in HBM to save memory (decompressed on-the-fly).
-    3. Metadata (weight_shape) is fixed to avoid decompression errors.
+    configs = []
+    for owner in (config, getattr(config, "text_config", None)):
+        if owner is None:
+            continue
+        qconfig = getattr(owner, "quantization_config", None)
+        if isinstance(qconfig, dict) and qconfig.get("format") == "pack-quantized":
+            configs.append(qconfig)
+    return configs
+
+
+def _normalize_pack_quantized_config_for_mixed_checkpoint(config, ckpt_path) -> int:
+    """Ignore plain-weight modules before compressed-tensors rewrites them.
+
+    Some pack-quantized checkpoints are mixed layout: routed experts are stored
+    as ``weight_packed`` while vision/projector/non-routed language modules are
+    stored as ordinary ``weight`` tensors.  compressed-tensors only sees
+    ``targets: ['Linear']`` in the config, so without exact ignores it can create
+    compressed placeholders for modules that have no packed checkpoint tensor.
+    That bloats dispatch memory and can OOM before post-load repair runs.
+    """
+
+    qconfigs = _pack_quantized_config_dicts(config)
+    if not qconfigs:
+        return 0
+
+    index_path = Path(ckpt_path) / "model.safetensors.index.json"
+    if not index_path.is_file():
+        return 0
+
+    try:
+        with index_path.open() as f:
+            weight_map = json.load(f).get("weight_map", {})
+    except Exception as e:
+        warnings.warn(f"Could not inspect pack-quantized weight map at {index_path}: {e}")
+        return 0
+
+    weight_keys = set(weight_map)
+    packed_modules = {
+        key[: -len(".weight_packed")] for key in weight_keys if key.endswith(".weight_packed")
+    }
+    plain_modules = sorted(
+        key[: -len(".weight")]
+        for key in weight_keys
+        if key.endswith(".weight") and key[: -len(".weight")] not in packed_modules
+    )
+    if not packed_modules or not plain_modules:
+        return 0
+
+    added_total = 0
+    for qconfig in qconfigs:
+        ignore = list(qconfig.get("ignore") or [])
+        seen = set(ignore)
+        added = 0
+        for module_name in plain_modules:
+            if module_name in seen:
+                continue
+            ignore.append(module_name)
+            seen.add(module_name)
+            added += 1
+        qconfig["ignore"] = ignore
+        added_total += added
+
+    if added_total:
+        print(
+            "Pack-quantized source config normalization: "
+            f"ignored_plain_modules={len(plain_modules)}, "
+            f"kept_packed_modules={len(packed_modules)}"
+        )
+    return added_total
+
+
+def _unpack_compressed_linear_weights(model, ckpt_path=None):
+    """Restore mixed compressed/plain checkpoints to a consistent module state.
+
+    Pack-quantized HF checkpoints can be partially compressed: Kimi K2.6, for
+    example, stores routed experts as ``weight_packed`` while keeping lm_head,
+    vision/projector, attention, routers, and shared experts as plain
+    ``weight`` tensors.  ``compressed_tensors`` initializes modules from the
+    quantization config, so it can create random ``weight_packed`` placeholders
+    for modules whose checkpoint entry is actually plain.  HuggingFace reports
+    those plain weights as "unused" during load; this helper makes the final
+    module state match the checkpoint key layout before PTQ/export continues.
     """
     try:
         from compressed_tensors.linear.compressed_linear import CompressedLinear
@@ -456,70 +535,147 @@ def _unpack_compressed_linear_weights(model, ckpt_path=None):
         except Exception:
             return None
 
-    # Load non-expert weights and metadata from safetensors
-    checkpoint_weights = {}
     index_file = _resolve_file("model.safetensors.index.json")
     if index_file:
         with open(index_file) as f:
             index = json.load(f)
-        st_filenames = list(set(index.get("weight_map", {}).values()))
+        weight_map = index.get("weight_map", {})
     else:
-        st_filenames = ["model.safetensors"]
-
-    for fname in st_filenames:
-        sf_path = _resolve_file(fname)
+        weight_map = {}
+        sf_path = _resolve_file("model.safetensors")
         if sf_path is None:
-            continue
+            return
         with safe_open(sf_path, framework="pt") as f:
-            for key in f.keys():  # noqa: SIM118 - safe_open is not iterable
-                if ".mlp.experts." not in key or "weight_shape" in key:
-                    checkpoint_weights[key] = f.get_tensor(key)
+            weight_map = {key: "model.safetensors" for key in f.keys()}
 
-    # Hybrid restoration
-    for name, module in model.named_modules():
-        if not isinstance(module, CompressedLinear):
-            continue
+    shard_cache = {}
+    shard_key_cache = {}
 
-        with torch.no_grad():
-            target_device = next(module.parameters()).device
+    def _get_shard(filename: str):
+        cached = shard_cache.get(filename)
+        if cached is not None:
+            return cached[1]
+        sf_path = _resolve_file(filename)
+        if sf_path is None:
+            return None
+        handle = safe_open(sf_path, framework="pt")
+        shard = handle.__enter__()
+        shard_cache[filename] = (handle, shard)
+        shard_key_cache[filename] = set(shard.keys())
+        return shard
 
-            # CASE A: Real BF16 weight exists (vision, lm_head)
-            if f"{name}.weight" in checkpoint_weights:
-                w = checkpoint_weights[f"{name}.weight"].to(target_device)
-                module._parameters.pop("weight", None)
-                module._buffers.pop("weight", None)
-                module.__dict__.pop("weight", None)
-                param = torch.nn.Parameter(w, requires_grad=False)
-                module._parameters["weight"] = param
-                module.__dict__["weight"] = param
-                module.quantization_status = QuantizationStatus.FROZEN
-                logger.debug("Restored BF16 layer: %s", name)
+    def _close_shards() -> None:
+        for handle, _ in shard_cache.values():
+            handle.__exit__(None, None, None)
 
-            # CASE B: Expert (stay compressed, fix metadata)
-            elif f"{name}.weight_shape" in checkpoint_weights:
-                ws = checkpoint_weights[f"{name}.weight_shape"]
-                if f"{name}.weight_packed" in checkpoint_weights:
-                    module.weight_packed = checkpoint_weights[f"{name}.weight_packed"].to(
-                        torch.int32
-                    )
-                module._parameters.pop("weight", None)
-                module._buffers.pop("weight", None)
-                module.__dict__.pop("weight", None)
-                shape_param = torch.nn.Parameter(ws.to(torch.int32), requires_grad=False)
-                module._parameters.pop("weight_shape", None)
-                module.__dict__.pop("weight_shape", None)
-                module._parameters["weight_shape"] = shape_param
-                module.__dict__["weight_shape"] = shape_param
+    def _load_tensor(key: str) -> torch.Tensor | None:
+        filename = weight_map.get(key)
+        if filename is None:
+            return None
+        shard = _get_shard(filename)
+        if shard is None:
+            return None
+        if key not in shard_key_cache[filename]:
+            return None
+        return shard.get_tensor(key)
 
-    # Ensure compressed experts do not carry a stale weight attribute
-    for name, module in model.named_modules():
-        if not isinstance(module, CompressedLinear):
-            continue
-        if getattr(module, "quantization_status", None) != QuantizationStatus.COMPRESSED:
-            continue
-        module._parameters.pop("weight", None)
-        module._buffers.pop("weight", None)
-        module.__dict__.pop("weight", None)
+    def _drop_attr(module: torch.nn.Module, attr: str) -> None:
+        module._parameters.pop(attr, None)
+        module._buffers.pop(attr, None)
+        module.__dict__.pop(attr, None)
+        if hasattr(module, attr):
+            try:
+                delattr(module, attr)
+            except AttributeError:
+                pass
+
+    def _put_frozen_parameter(module: torch.nn.Module, attr: str, tensor: torch.Tensor) -> None:
+        _drop_attr(module, attr)
+        module._parameters[attr] = torch.nn.Parameter(tensor, requires_grad=False)
+        module.__dict__[attr] = module._parameters[attr]
+
+    def _put_buffer(module: torch.nn.Module, attr: str, tensor: torch.Tensor) -> None:
+        _drop_attr(module, attr)
+        module.register_buffer(attr, tensor, persistent=True)
+
+    def _target_device(module: torch.nn.Module) -> torch.device:
+        for tensor in list(module.parameters(recurse=False)) + list(module.buffers(recurse=False)):
+            if not tensor.is_meta:
+                return tensor.device
+        hook = getattr(module, "_hf_hook", None)
+        execution_device = getattr(hook, "execution_device", None)
+        if execution_device is not None:
+            return torch.device(execution_device)
+        return torch.device("cpu")
+
+    compressed_attrs = (
+        "weight_packed",
+        "weight_scale",
+        "weight_zero_point",
+        "weight_g_idx",
+        "weight_shape",
+    )
+
+    restored_plain = 0
+    kept_compressed = 0
+
+    try:
+        for name, module in model.named_modules():
+            if not isinstance(module, CompressedLinear):
+                continue
+
+            plain_weight_key = f"{name}.weight"
+            packed_weight_key = f"{name}.weight_packed"
+
+            with torch.no_grad():
+                target_device = _target_device(module)
+
+                # CASE A: The checkpoint has a real plain weight for this module.
+                # Remove all compressed placeholders so state_dict/export cannot
+                # accidentally carry randomly initialized packed tensors.
+                if plain_weight_key in weight_map:
+                    weight = _load_tensor(plain_weight_key)
+                    if weight is None:
+                        continue
+                    for attr in compressed_attrs:
+                        _drop_attr(module, attr)
+                    _put_frozen_parameter(module, "weight", weight.to(target_device))
+                    if hasattr(module, "quantization_scheme"):
+                        module.quantization_scheme = None
+                    module.quantization_status = QuantizationStatus.FROZEN
+                    restored_plain += 1
+                    logger.debug("Restored BF16 layer: %s", name)
+                    continue
+
+                # CASE B: The checkpoint really is compressed for this module.
+                # Keep it compressed in memory and make sure no stale plain weight
+                # remains from torch.nn.Linear initialization.
+                if packed_weight_key in weight_map:
+                    _drop_attr(module, "weight")
+                    for attr in compressed_attrs:
+                        key = f"{name}.{attr}"
+                        if key not in weight_map:
+                            continue
+                        tensor = _load_tensor(key)
+                        if tensor is None:
+                            continue
+                        tensor = tensor.to(target_device)
+                        if attr in {"weight_packed", "weight_shape"}:
+                            tensor = tensor.to(torch.int32)
+                        if attr == "weight_shape":
+                            _put_frozen_parameter(module, attr, tensor)
+                        else:
+                            _put_buffer(module, attr, tensor)
+                    module.quantization_status = QuantizationStatus.COMPRESSED
+                    kept_compressed += 1
+    finally:
+        _close_shards()
+
+    if restored_plain or kept_compressed:
+        print(
+            "Pack-quantized source normalization: "
+            f"restored_plain={restored_plain}, kept_compressed={kept_compressed}"
+        )
 
 
 def get_model(
@@ -589,17 +745,11 @@ def get_model(
 
         # Helper function to check if model has pack-quantized config
         def has_pack_quantized_config(config):
-            # Check top-level quantization_config
-            if hasattr(config, "quantization_config"):
-                if config.quantization_config.get("format", None) == "pack-quantized":
-                    return True
-            # Check nested text_config.quantization_config (for multi-modal models like kimi k2.5)
-            if hasattr(config, "text_config") and hasattr(
-                config.text_config, "quantization_config"
-            ):
-                if config.text_config.quantization_config.get("format", None) == "pack-quantized":
-                    return True
-            return False
+            return bool(_pack_quantized_config_dicts(config))
+
+        if has_pack_quantized_config(hf_config):
+            _normalize_pack_quantized_config_for_mixed_checkpoint(hf_config, ckpt_path)
+            model_kwargs["config"] = hf_config
 
         if is_speculative(hf_config):
             model = AutoModelForCausalLM.from_pretrained(

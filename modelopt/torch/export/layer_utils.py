@@ -31,7 +31,8 @@ except Exception:
 from modelopt.torch.utils import distributed as dist
 from modelopt.torch.utils import import_plugin
 
-from ..quantization.nn import SequentialQuantizer, TensorQuantizer
+from ..quantization.nn import NVFP4StaticQuantizer, SequentialQuantizer, TensorQuantizer
+from ..quantization.utils import reduce_block_amax
 from .hf_config_map import HF_CONFIG_MAP
 from .mcore_config_map import MCORE_CONFIG_MAP
 from .model_config import (
@@ -313,6 +314,8 @@ def is_moe(module: nn.Module) -> bool:
     name = type(module).__name__.lower()
     # Auto-detect common MoE patterns
     if name.endswith("sparsemoeblock") or "moelayer" in name:
+        return True
+    if "moe" in name and hasattr(module, "experts"):
         return True
     # Explicit matches for non-standard naming
     return any(key in name for key in ["arcticmoe", "deepseekmoe", "dbrxffn", "nemotronhmoe"])
@@ -981,6 +984,19 @@ def get_expert_linear_names(module: nn.Module) -> list[str]:
     if hasattr(module, "experts") and hasattr(module.experts, "gate_up_proj_weight_quantizers"):
         return ["gate_up_proj", "down_proj"]
 
+    experts = getattr(module, "experts", None)
+    if experts is not None and hasattr(experts, "__iter__"):
+        first_expert = next(iter(experts), None)
+        if first_expert is not None:
+            for linear_names in (
+                ["gate_proj", "down_proj", "up_proj"],
+                ["w1", "w2", "w3"],
+                ["linear_fc1", "linear_fc2"],
+                ["up_proj", "down_proj"],
+            ):
+                if all(hasattr(first_expert, linear_name) for linear_name in linear_names):
+                    return linear_names
+
     if module_match_name_list(
         module,
         [
@@ -989,6 +1005,7 @@ def get_expert_linear_names(module: nn.Module) -> list[str]:
             "Qwen3NextSparseMoeBlock",
             "Qwen3_5MoeSparseMoeBlock",
             "DeepseekMoE",
+            "DeepseekV3MoE",
         ],
     ):
         return ["gate_proj", "down_proj", "up_proj"]
@@ -1017,19 +1034,16 @@ def set_expert_quantizer_amax(
     quantizer_attrs: str | list[str] | None = None,
     fallback_value: float = 0.5,
     device: torch.device | None = None,
-    root_model: nn.Module | None = None,
+    strict_missing_input_amax: bool = False,
 ) -> list[nn.Module]:
-    """Set amax values for expert quantizers using smart fallback logic.
+    """Fill missing expert quantizer amax values before export.
 
-    Uses smart fallback logic:
-
-    1. Use max from existing quantizers in current batch (best - direct from calibration)
-    2. If no existing values found, then:
-       - For weight quantizers: calculate from weight statistics
-       - For input quantizers: use max from other experts, fallback if none found
-    3. Use fallback value as last resort
-
-    This ensures we always have semantically appropriate amax values for export.
+    For backward compatibility, missing values are filled from existing
+    quantizers in the same group, from weight statistics for weight-only
+    quantizers, or from ``fallback_value`` as a last resort.  If
+    ``strict_missing_input_amax`` is true, enabled expert input quantizers
+    must already have a nonzero calibrated amax and export raises instead of
+    synthesizing activation scales.
 
     Args:
         modules: Single module or list of modules containing quantizers
@@ -1037,13 +1051,9 @@ def set_expert_quantizer_amax(
             If None, defaults to ["input_quantizer"] for backward compatibility.
         fallback_value: Final fallback value when other methods fail (default: 0.5)
         device: Target device for tensors (auto-detected if None)
-        root_model: When ``modules`` are members of an FSDPModule-wrapped
-            model, pass the root model so the per-expert weight-statistics
-            fallback can read unsharded weights via
-            ``fsdp2_aware_weight_update``.  Without this, ``module.weight``
-            returns the per-rank shard which gives nearly-identical
-            max-abs across MoE experts (same shard pattern + similar
-            trained-weight magnitudes), defeating the per-expert fallback.
+        strict_missing_input_amax: If True, raise when an enabled input quantizer is missing
+            a nonzero amax instead of synthesizing one. Use this for runs that explicitly force
+            full expert calibration coverage.
 
     Returns:
         uncalibrated_modules: a list of uncalibrated experts
@@ -1085,6 +1095,13 @@ def set_expert_quantizer_amax(
                 ):
                     all_quantizers.append((module, attr_name, quantizer))
 
+    if strict_missing_input_amax and any("input_quantizer" in attr for attr in quantizer_attrs):
+        if not all_quantizers:
+            raise RuntimeError(
+                "Strict MoE input amax validation found no enabled input quantizers. "
+                "Check that the recipe selected the intended expert projection input quantizers."
+            )
+
     target_amax = None
 
     # Collect ANY existing amax values from current batch (most direct source)
@@ -1104,7 +1121,7 @@ def set_expert_quantizer_amax(
     if len(valid_amax_values) > 0:
         target_amax = torch.max(torch.stack(valid_amax_values))
 
-    # If no existing values in current batch, apply type-specific fallback logic
+    # If no existing values in current batch, apply type-specific fallback logic.
     elif target_amax is None:
         has_input_quantizers = any("input_quantizer" in attr for _, attr, _ in all_quantizers)
         has_weight_quantizers = any("weight_quantizer" in attr for _, attr, _ in all_quantizers)
@@ -1126,135 +1143,12 @@ def set_expert_quantizer_amax(
             if weight_amax_values:
                 target_amax = torch.max(torch.stack(weight_amax_values)).item()
         elif has_input_quantizers:
-            # For input quantizers: ideally search other experts for existing input amax values
-            # TODO: Implement broader expert search - currently function only has access to current batch
-            # For now, this will fall through to fallback value
+            # Non-strict legacy path: fall through to fallback_value for input quantizers.
             pass
 
     # Final fallback
     if target_amax is None:
         target_amax = fallback_value
-        has_input_quantizers = any("input_quantizer" in attr for _, attr, _ in all_quantizers)
-
-    # ---- per-expert input-quantizer fallback ----
-    # When the broadcast ``target_amax`` would be applied to an
-    # ``input_quantizer`` whose own amax is missing/zero (i.e. its expert
-    # did not receive any tokens during calibration), the result is that
-    # *every* uncalibrated expert in the layer ends up with an IDENTICAL
-    # input_scale -- destroying per-expert specialization.  This was the
-    # K2.6 NVFP4 quality regression observed 2026-04-27: with
-    # nemotron-post-training-v2 calibration + top_k=8 routing across 384
-    # experts, only a small fraction received tokens, so every uncalibrated
-    # expert got the broadcast ``torch.max(stack(activated_amax))`` value.
-    # vLLM then dequantized expert activations against a single wrong scale
-    # and the model emitted repetitive garbage ("foss foss foss...") at
-    # inference; lm-eval scored at random chance (gsm8k=0%, mmlu=27%, etc.)
-    # despite the export structurally matching nvidia/Kimi-K2.5-NVFP4.
-    #
-    # Fix: derive the uncalibrated expert's input amax from its own weight
-    # tensor's max-abs scaled by an empirical ratio.  When the layer has
-    # ANY directly-calibrated experts, learn the ratio from them
-    # (median(calibrated_amax / weight_max_abs)) and apply it to the
-    # uncalibrated peers -- their relative magnitudes survive even though
-    # their absolute amax is approximate.  When NO experts are calibrated
-    # in this batch, fall back to a default ratio of 1.0 (activation amax
-    # ~ weight max-abs after LayerNorm in trained transformers, observed
-    # to be a reasonable order-of-magnitude estimate).
-    #
-    # FSDP2 subtlety: when ``modules`` come from an FSDPModule-wrapped
-    # model, ``module.weight`` returns the per-rank shard, NOT the global
-    # tensor.  Sharded local views give nearly-identical max-abs across
-    # K2.6's 384 experts (same shard pattern + similar trained-weight
-    # magnitudes after training), defeating the per-expert fallback --
-    # uniform input_scale across experts is exactly the broken-broadcast
-    # behaviour we're trying to fix.  Cache weight_max_abs *inside* an
-    # ``fsdp2_aware_weight_update`` context (which all-gathers the
-    # shard), so the values reflect the true global tensor.  Caller
-    # must pass ``root_model`` for this to work; without it we fall
-    # back to the sharded-view behaviour and warn.
-    from modelopt.torch.quantization.utils import fsdp2_aware_weight_update
-
-    _weight_max_abs_cache: dict[int, float] = {}
-
-    def _read_weight_max_abs_locked(module: nn.Module) -> float | None:
-        """Read weight max-abs from the LIVE module.weight tensor.
-
-        Caller must guarantee the weight is unsharded (via
-        ``fsdp2_aware_weight_update``) when the module is FSDP-wrapped.
-        """
-        for weight_attr in ("weight", "gate_up_proj", "down_proj"):
-            if hasattr(module, weight_attr):
-                w = getattr(module, weight_attr)
-                if w is not None and w.numel() > 0:
-                    return float(torch.max(torch.abs(w)).item())
-        return None
-
-    def _populate_weight_max_abs_cache(modules_to_read: list[nn.Module]) -> None:
-        """Populate the cache by reading each module's weight under the
-        appropriate FSDP unshard context.
-
-        For non-FSDP models, ``fsdp2_aware_weight_update`` is a no-op
-        wrapper; the cache is populated directly.
-        """
-        if root_model is None:
-            for module in modules_to_read:
-                key = id(module)
-                if key in _weight_max_abs_cache:
-                    continue
-                val = _read_weight_max_abs_locked(module)
-                if val is not None:
-                    _weight_max_abs_cache[key] = val
-            return
-        # All modules in a single ``set_expert_quantizer_amax`` call are
-        # siblings within the same FSDPModule (typically all gate_proj
-        # of one MoE block, or all up_proj, etc.), so a single
-        # ``fsdp2_aware_weight_update`` covers the whole batch.
-        with fsdp2_aware_weight_update(root_model, modules_to_read, reshard=True):
-            for module in modules_to_read:
-                key = id(module)
-                if key in _weight_max_abs_cache:
-                    continue
-                val = _read_weight_max_abs_locked(module)
-                if val is not None:
-                    _weight_max_abs_cache[key] = val
-
-    # Read weights ONCE under unshard, cache for the rest of the function.
-    _populate_weight_max_abs_cache(modules)
-
-    def _per_module_weight_max_abs(module: nn.Module) -> float | None:
-        return _weight_max_abs_cache.get(id(module))
-
-    # Pre-compute the empirical amax/weight_max_abs ratio from any
-    # calibrated input_quantizers in this batch.  Median rather than
-    # mean to be robust to a single rogue expert with an outlier amax
-    # (which is exactly what the broadcast-max bug produces if you feed
-    # the bug's output back into the function).
-    _calibrated_ratios: list[float] = []
-    for module, attr_name, quantizer in all_quantizers:
-        if "input_quantizer" not in attr_name:
-            continue
-        ex_amax = getattr(quantizer, "amax", None)
-        if ex_amax is None:
-            continue
-        if isinstance(ex_amax, torch.Tensor):
-            if torch.all(ex_amax == 0):
-                continue
-            ex_amax_val = float(ex_amax.item()) if ex_amax.numel() == 1 else float(ex_amax.max().item())
-        else:
-            ex_amax_val = float(ex_amax)
-        w_max = _per_module_weight_max_abs(module)
-        if w_max and w_max > 0:
-            _calibrated_ratios.append(ex_amax_val / w_max)
-    _empirical_ratio = (
-        float(torch.median(torch.tensor(_calibrated_ratios)).item())
-        if _calibrated_ratios else 1.0
-    )
-
-    def _per_expert_input_amax(module: nn.Module, default: float) -> float:
-        w_max = _per_module_weight_max_abs(module)
-        if w_max is None or w_max <= 0:
-            return default
-        return w_max * _empirical_ratio
 
     # Apply target amax to quantizers that need it
     for module, attr_name, quantizer in all_quantizers:
@@ -1269,30 +1163,18 @@ def set_expert_quantizer_amax(
             needs_amax = False
 
         if needs_amax:
-            # For ``input_quantizer`` fallback, prefer the per-expert
-            # weight-statistics value over the broadcast ``target_amax``
-            # to preserve per-expert specialization across the MoE layer.
-            # ``target_amax`` (the broadcast value) is still used for
-            # ``weight_quantizer`` fallback, where per-expert weight
-            # statistics happen to cluster more tightly so the broadcast
-            # is acceptable.
-            if "input_quantizer" in attr_name:
-                fallback_default = (
-                    target_amax if not isinstance(target_amax, torch.Tensor)
-                    else target_amax.item()
+            if strict_missing_input_amax and "input_quantizer" in attr_name:
+                raise RuntimeError(
+                    f"Missing nonzero amax for {attr_name} in {type(module).__name__}. "
+                    "Forced MoE expert calibration was enabled, so export refuses to synthesize "
+                    "an activation scale. Check MoE expert coverage and quantizer selection before export."
                 )
-                amax_value = _per_expert_input_amax(module, float(fallback_default))
-                amax_tensor = torch.tensor(
-                    amax_value, dtype=torch.float32, device=target_device
-                )
-            elif isinstance(target_amax, torch.Tensor):
-                amax_tensor = target_amax.clone().to(
-                    dtype=torch.float32, device=target_device
-                )
+
+            # Create tensor with appropriate value (using function-wide target_device)
+            if isinstance(target_amax, torch.Tensor):
+                amax_tensor = target_amax.clone().to(dtype=torch.float32, device=target_device)
             else:
-                amax_tensor = torch.tensor(
-                    target_amax, dtype=torch.float32, device=target_device
-                )
+                amax_tensor = torch.tensor(target_amax, dtype=torch.float32, device=target_device)
 
             # Set amax value using property for proper validation and tensor handling
             quantizer.amax = amax_tensor
@@ -1320,60 +1202,291 @@ def set_expert_quantizer_amax(
 _GATE_UP_PAIRS = [("gate_proj", "up_proj"), ("w1", "w3")]
 
 
+def _set_quantizer_amax_from_tensor(weight_quantizer: TensorQuantizer, tensor: torch.Tensor) -> None:
+    if not isinstance(weight_quantizer, nn.Module):
+        weight_quantizer.amax = tensor.clone().detach()
+        return
+    if hasattr(weight_quantizer, "_amax"):
+        delattr(weight_quantizer, "_amax")
+    weight_quantizer.register_buffer("_amax", tensor.clone().detach())
+
+
+def _set_quantizer_global_amax_from_tensor(
+    weight_quantizer: TensorQuantizer, tensor: torch.Tensor
+) -> None:
+    if not isinstance(weight_quantizer, nn.Module):
+        weight_quantizer.global_amax = tensor.clone().detach()
+        return
+    if hasattr(weight_quantizer, "_global_amax"):
+        delattr(weight_quantizer, "_global_amax")
+    weight_quantizer.register_buffer("_global_amax", tensor.clone().detach())
+
+
+def _to_local_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    if hasattr(tensor, "to_local"):
+        return tensor.to_local()
+    return tensor
+
+
+def _ensure_nvfp4_static_weight_amax(
+    linear: nn.Module,
+    weight_quantizer: NVFP4StaticQuantizer,
+    *,
+    context: str,
+) -> bool:
+    """Populate missing NVFP4 static per-block/global amax from the real weight."""
+
+    need_per_block = not hasattr(weight_quantizer, "_amax") or weight_quantizer.amax is None
+    need_global = (
+        not hasattr(weight_quantizer, "_global_amax") or weight_quantizer.global_amax is None
+    )
+    if not (need_per_block or need_global):
+        return False
+
+    weight = getattr(linear, "weight", None)
+    if weight is None:
+        warn(f"Skipping NVFP4 static amax fill for {context}: module has no weight.")
+        return False
+    if weight.is_meta:
+        warn(f"Skipping NVFP4 static amax fill for {context}: weight is a meta tensor.")
+        return False
+
+    block_size = get_weight_block_size(linear, "weight")
+    if not block_size:
+        warn(f"Skipping NVFP4 static amax fill for {context}: missing NVFP4 block size.")
+        return False
+
+    per_block_amax = reduce_block_amax(weight.detach(), block_sizes={-1: block_size})
+    if need_per_block:
+        _set_quantizer_amax_from_tensor(weight_quantizer, per_block_amax.to(weight.device))
+    if need_global:
+        _set_quantizer_global_amax_from_tensor(weight_quantizer, per_block_amax.max())
+    return True
+
+
+def _sync_gate_up_linear_amax(
+    gate_linear: nn.Module,
+    up_linear: nn.Module,
+    *,
+    context: str,
+    calibrate_missing_weight_amax: bool = False,
+) -> bool:
+    """Take element-wise max of gate/up weight quantizer amaxes for one pair."""
+
+    gate_wq = getattr(gate_linear, "weight_quantizer", None)
+    up_wq = getattr(up_linear, "weight_quantizer", None)
+    if gate_wq is None or up_wq is None:
+        return False
+
+    if not getattr(gate_wq, "is_enabled", True) or not getattr(up_wq, "is_enabled", True):
+        return False
+
+    if isinstance(gate_wq, NVFP4StaticQuantizer) and isinstance(up_wq, NVFP4StaticQuantizer):
+        if calibrate_missing_weight_amax:
+            _ensure_nvfp4_static_weight_amax(
+                gate_linear, gate_wq, context=f"{context}.{type(gate_linear).__name__}"
+            )
+            _ensure_nvfp4_static_weight_amax(
+                up_linear, up_wq, context=f"{context}.{type(up_linear).__name__}"
+            )
+
+        gate_global_amax = getattr(gate_wq, "global_amax", None)
+        up_global_amax = getattr(up_wq, "global_amax", None)
+        if gate_global_amax is None or up_global_amax is None:
+            return False
+        if gate_global_amax.is_meta or up_global_amax.is_meta:
+            warn(
+                f"Skipping gate/up global_amax sync for {context} with meta tensors "
+                f"(gate_global_amax.is_meta={gate_global_amax.is_meta}, "
+                f"up_global_amax.is_meta={up_global_amax.is_meta})."
+            )
+            return False
+        gate_global_amax = _to_local_tensor(gate_global_amax)
+        up_global_amax = _to_local_tensor(up_global_amax)
+        up_global_for_max = up_global_amax.to(
+            device=gate_global_amax.device, dtype=gate_global_amax.dtype
+        )
+        if torch.equal(gate_global_amax, up_global_for_max):
+            return False
+        shared_global_amax = torch.max(gate_global_amax, up_global_for_max)
+        _set_quantizer_global_amax_from_tensor(gate_wq, shared_global_amax)
+        _set_quantizer_global_amax_from_tensor(
+            up_wq,
+            shared_global_amax.to(device=up_global_amax.device, dtype=up_global_amax.dtype),
+        )
+        return True
+
+    gate_amax = getattr(gate_wq, "amax", None)
+    up_amax = getattr(up_wq, "amax", None)
+    if gate_amax is None or up_amax is None:
+        return False
+
+    # Meta tensors have no storage (e.g. CPU-offloaded modules that were
+    # never activated during calibration). Skip; there is no real amax data to sync.
+    if gate_amax.is_meta or up_amax.is_meta:
+        warn(
+            f"Skipping gate/up amax sync for {context} with meta tensors "
+            f"(gate_amax.is_meta={gate_amax.is_meta}, "
+            f"up_amax.is_meta={up_amax.is_meta})."
+        )
+        return False
+
+    gate_amax = _to_local_tensor(gate_amax)
+    up_amax = _to_local_tensor(up_amax)
+    did_sync = False
+    gate_global_amax = getattr(gate_wq, "global_amax", None)
+    up_global_amax = getattr(up_wq, "global_amax", None)
+    if gate_global_amax is not None and up_global_amax is not None:
+        if gate_global_amax.is_meta or up_global_amax.is_meta:
+            warn(
+                f"Skipping gate/up global_amax sync for {context} with meta tensors "
+                f"(gate_global_amax.is_meta={gate_global_amax.is_meta}, "
+                f"up_global_amax.is_meta={up_global_amax.is_meta})."
+            )
+        else:
+            gate_global_amax = _to_local_tensor(gate_global_amax)
+            up_global_amax = _to_local_tensor(up_global_amax)
+            up_global_for_max = up_global_amax.to(
+                device=gate_global_amax.device, dtype=gate_global_amax.dtype
+            )
+            if not torch.equal(gate_global_amax, up_global_for_max):
+                shared_global_amax = torch.max(gate_global_amax, up_global_for_max)
+                _set_quantizer_global_amax_from_tensor(gate_wq, shared_global_amax)
+                _set_quantizer_global_amax_from_tensor(
+                    up_wq,
+                    shared_global_amax.to(
+                        device=up_global_amax.device, dtype=up_global_amax.dtype
+                    ),
+                )
+                did_sync = True
+
+    up_amax_for_max = up_amax.to(device=gate_amax.device, dtype=gate_amax.dtype)
+    if not torch.equal(gate_amax, up_amax_for_max):
+        shared_amax = torch.max(gate_amax, up_amax_for_max)
+        _set_quantizer_amax_from_tensor(gate_wq, shared_amax)
+        _set_quantizer_amax_from_tensor(
+            up_wq, shared_amax.to(device=up_amax.device, dtype=up_amax.dtype)
+        )
+        did_sync = True
+
+    return did_sync
+
+
+def sync_direct_gate_up_amax(
+    module: nn.Module,
+    *,
+    context: str = "",
+    calibrate_missing_weight_amax: bool = False,
+    root_model: nn.Module | None = None,
+    reshard: bool = True,
+) -> int:
+    """Sync direct gate/up children on ``module`` and return changed pair count."""
+
+    synced = 0
+    for gate_name, up_name in _GATE_UP_PAIRS:
+        gate_linear = getattr(module, gate_name, None)
+        up_linear = getattr(module, up_name, None)
+        if gate_linear is None or up_linear is None:
+            continue
+        if calibrate_missing_weight_amax and root_model is not None:
+            from modelopt.torch.quantization.utils import fsdp2_aware_weight_update
+
+            with fsdp2_aware_weight_update(root_model, [gate_linear, up_linear], reshard=reshard):
+                did_sync = _sync_gate_up_linear_amax(
+                    gate_linear,
+                    up_linear,
+                    context=f"{context or '<root>'}.{gate_name}/{up_name}",
+                    calibrate_missing_weight_amax=True,
+                )
+        else:
+            did_sync = _sync_gate_up_linear_amax(
+                gate_linear,
+                up_linear,
+                context=f"{context or '<root>'}.{gate_name}/{up_name}",
+                calibrate_missing_weight_amax=calibrate_missing_weight_amax,
+            )
+        if did_sync:
+            synced += 1
+    return synced
+
+
 def sync_moe_gate_up_amax(model: nn.Module) -> int:
-    """Take element-wise max of gate and up weight quantizer amaxes per expert.
+    """Take element-wise max of gate and up weight quantizer amaxes.
 
     Serving engines fuse gate_proj and up_proj into a single gate_up_proj and
     require a single weight_scale_2. Since weight_scale_2 = amax / (6 * 448),
     syncing amaxes before quantization ensures the per-block weight_scale values
     are computed against a consistent global scale.
 
-    Only affects standard MoE models with separate gate/up linear layers
-    (e.g. Qwen MoE, DeepSeek). Models with already-fused gate_up_proj
-    (e.g. Llama4, GptOss) are unaffected.
+    This covers every standard gated MLP with separate gate/up linear layers:
+    dense MLPs, shared experts, and routed experts. Models with already-fused
+    gate_up_proj (e.g. Llama4, GptOss) are unaffected.
 
     Returns:
-        Number of expert gate/up pairs whose amaxes were synced.
+        Number of gate/up pairs whose amaxes were synced.
     """
     synced = 0
-    for _, sub_module in model.named_modules():
-        if not (is_moe(sub_module) and hasattr(sub_module, "experts")):
-            continue
-        if not hasattr(sub_module.experts, "__iter__"):
-            continue
-        for expert in sub_module.experts:
-            for gate_name, up_name in _GATE_UP_PAIRS:
-                gate_linear = getattr(expert, gate_name, None)
-                up_linear = getattr(expert, up_name, None)
-                if gate_linear is None or up_linear is None:
-                    continue
-                gate_wq = getattr(gate_linear, "weight_quantizer", None)
-                up_wq = getattr(up_linear, "weight_quantizer", None)
-                if gate_wq is None or up_wq is None:
-                    break
-                gate_amax = getattr(gate_wq, "amax", None)
-                up_amax = getattr(up_wq, "amax", None)
-                if gate_amax is None or up_amax is None:
-                    break
-                # Meta tensors have no storage (e.g. CPU-offloaded experts that
-                # were never activated during calibration). Skip — there is no
-                # real amax data to sync.
-                if gate_amax.is_meta or up_amax.is_meta:
-                    warn(
-                        f"Skipping gate/up amax sync for expert with meta tensors "
-                        f"(gate_amax.is_meta={gate_amax.is_meta}, "
-                        f"up_amax.is_meta={up_amax.is_meta}). "
-                        f"This typically means the expert was CPU-offloaded and "
-                        f"not activated during calibration."
-                    )
-                    break
-                if not torch.equal(gate_amax, up_amax):
-                    shared_amax = torch.max(gate_amax, up_amax)
-                    gate_wq.amax = shared_amax
-                    up_wq.amax = shared_amax.clone()
-                    synced += 1
-                break
+    for module_name, sub_module in model.named_modules():
+        synced += sync_direct_gate_up_amax(sub_module, context=module_name or "<root>")
     return synced
+
+
+def _gate_up_linear_scalar_buffer_mismatches(
+    gate_linear: nn.Module,
+    up_linear: nn.Module,
+    buffer_name: str,
+    *,
+    context: str,
+) -> bool:
+    gate_value = getattr(gate_linear, buffer_name, None)
+    up_value = getattr(up_linear, buffer_name, None)
+    if gate_value is None or up_value is None:
+        return False
+    if not isinstance(gate_value, torch.Tensor) or not isinstance(up_value, torch.Tensor):
+        return False
+    if gate_value.is_meta or up_value.is_meta:
+        warn(
+            f"Skipping gate/up {buffer_name} sync for {context} with meta tensors "
+            f"(gate_value.is_meta={gate_value.is_meta}, up_value.is_meta={up_value.is_meta})."
+        )
+        return False
+    if gate_value.shape != up_value.shape:
+        warn(
+            f"Skipping gate/up {buffer_name} comparison for {context} with different shapes "
+            f"(gate={tuple(gate_value.shape)}, up={tuple(up_value.shape)})."
+        )
+        return False
+    return not torch.equal(gate_value, up_value.to(device=gate_value.device, dtype=gate_value.dtype))
+
+
+def count_moe_gate_up_export_buffer_mismatches(model: nn.Module) -> int:
+    """Count mismatched exported gate/up scalar scale buffers.
+
+    ``sync_moe_gate_up_amax`` and ``sync_direct_gate_up_amax`` must run before
+    quantized weights are packed because ``weight_scale`` is computed relative
+    to ``weight_scale_2``.  After export we only detect mismatches; mutating
+    ``weight_scale_2`` here would make the packed weight and per-block scales
+    internally inconsistent.
+
+    Returns:
+        Number of gate/up pairs whose exported buffers differ.
+    """
+
+    mismatches = 0
+    for module_name, sub_module in model.named_modules():
+        for gate_name, up_name in _GATE_UP_PAIRS:
+            gate_linear = getattr(sub_module, gate_name, None)
+            up_linear = getattr(sub_module, up_name, None)
+            if gate_linear is None or up_linear is None:
+                continue
+            if _gate_up_linear_scalar_buffer_mismatches(
+                gate_linear,
+                up_linear,
+                "weight_scale_2",
+                context=f"{module_name or '<root>'}.{gate_name}/{up_name}",
+            ):
+                mismatches += 1
+    return mismatches
 
 
 def build_stacked_experts(

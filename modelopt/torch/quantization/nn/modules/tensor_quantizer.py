@@ -994,7 +994,7 @@ class TensorQuantizer(nn.Module):
             amax = self.amax
         else:
             amax = self.amax.reshape(self._amax_shape_for_export)
-        amax[amax == 0] = self.maxbound
+        amax = torch.where(amax == 0, torch.full_like(amax, self.maxbound), amax)
         amax = torch.nan_to_num(amax, nan=self.maxbound)
         clamp_min, clamp_max = torch.finfo(amax.dtype).tiny, torch.finfo(amax.dtype).max
         amax = amax.clamp(min=clamp_min, max=clamp_max)
